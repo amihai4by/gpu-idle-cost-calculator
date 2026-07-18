@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Idle-Cost Calculator — how much your idle GPUs waste per year</title>
+<meta name="description" content="Free calculator: see how much money your Kubernetes GPU fleet wastes on idle, allocated-but-unused GPUs. Enter fleet size, GPU type and average utilization to get your annual idle-cost and reclaimable savings.">
+<link rel="canonical" href="https://amihai4by.github.io/gpu-idle-cost-calculator/">
+<meta name="robots" content="index,follow">
+<!-- Open Graph -->
+<meta property="og:type" content="website">
+<meta property="og:title" content="GPU Idle-Cost Calculator — what your idle GPUs cost you">
+<meta property="og:description" content="Most GPU fleets waste 60–70% of spend on idle cards. Enter your fleet and utilization to see the annual number — and how much you can reclaim.">
+<meta property="og:url" content="https://amihai4by.github.io/gpu-idle-cost-calculator/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="GPU Idle-Cost Calculator">
+<meta name="twitter:description" content="See how much your idle Kubernetes GPUs waste per year — and what you can reclaim.">
+<!-- Structured data: the tool + FAQ, so search engines understand the page -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "GPU Idle-Cost Calculator",
+  "applicationCategory": "BusinessApplication",
+  "operatingSystem": "Web",
+  "description": "Calculate how much money a Kubernetes GPU fleet wastes on idle, allocated-but-unused GPUs, and how much can be reclaimed by raising utilization.",
+  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type":"Question","name":"How much do idle GPUs cost?","acceptedAnswer":{"@type":"Answer","text":"A GPU you pay for but don't use is pure waste. An idle H100 at roughly $2.50/hr burns about $1,800/month even at 0% utilization. Across a fleet running at 30% average utilization, 70% of the GPU bill is paying for idle time."}},
+    {"@type":"Question","name":"What is a good GPU utilization target?","acceptedAnswer":{"@type":"Answer","text":"Most fleets run at 20–40% average utilization. Raising to 60–70% via right-sizing, GPU sharing (time-slicing/MIG), idle reclamation, and autoscaling typically cuts the GPU bill by 30–60% for the same useful work."}},
+    {"@type":"Question","name":"How do I reduce Kubernetes GPU costs?","acceptedAnswer":{"@type":"Answer","text":"Measure per-GPU utilization (DCGM + Prometheus), share GPUs for light workloads (time-slicing) or partition them (MIG), cap hoarding with quotas, run interruptible work on spot nodes, and automatically reclaim idle allocated GPUs."}}
+  ]
+}
+</script>
+<style>
+:root{
+  --bg:#ffffff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;
+  --accent:#00afa9;--accent2:#70d4b4;--warn:#d64545;--good:#1a9d6b;
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31;}
+}
+*{box-sizing:border-box}
+body{margin:0;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:860px;margin:0 auto;padding:2rem 1.2rem 4rem}
+header h1{font-size:2rem;line-height:1.2;margin:.2rem 0 .4rem}
+header p.sub{color:var(--muted);font-size:1.1rem;margin:.2rem 0 1.6rem}
+.calc{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:1.4rem;margin:1.5rem 0}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+@media(max-width:560px){.grid{grid-template-columns:1fr}}
+label{display:block;font-weight:600;margin:.2rem 0 .3rem;font-size:.92rem}
+input,select{width:100%;padding:.55rem .6rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font-size:1rem}
+.range-row{display:flex;align-items:center;gap:.6rem}
+.range-row input[type=range]{flex:1}
+.range-val{min-width:3.2rem;text-align:right;font-variant-numeric:tabular-nums;font-weight:700;color:var(--accent)}
+.out{margin-top:1.4rem;display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+@media(max-width:560px){.out{grid-template-columns:1fr}}
+.stat{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:1rem}
+.stat .k{font-size:.8rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.stat .v{font-size:1.7rem;font-weight:800;font-variant-numeric:tabular-nums;margin-top:.2rem}
+.v.waste{color:var(--warn)} .v.save{color:var(--good)}
+.headline{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin-top:1.4rem;font-size:1.15rem;font-weight:700}
+.headline b{font-size:1.5rem}
+h2{margin-top:2.6rem;font-size:1.4rem}
+.cta{border:1px solid var(--border);border-radius:12px;padding:1.2rem;margin:1rem 0;background:var(--card)}
+.cta a{display:inline-block;margin-top:.5rem;background:var(--accent);color:#04211f;font-weight:700;text-decoration:none;padding:.55rem 1rem;border-radius:8px}
+.cta a:hover{background:var(--accent2)}
+.muted{color:var(--muted)} small{color:var(--muted)}
+table{width:100%;border-collapse:collapse;margin:.6rem 0}
+th,td{text-align:left;padding:.45rem .5rem;border-bottom:1px solid var(--border);font-size:.94rem}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.88rem}
+a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>GPU Idle-Cost Calculator</h1>
+  <p class="sub">Most Kubernetes GPU fleets waste <strong>60–70% of their spend</strong> on allocated-but-idle cards. Enter yours to see the annual number — and what you can reclaim.</p>
+</header>
+
+<section class="calc" aria-label="calculator">
+  <div class="grid">
+    <div>
+      <label for="gpus">Number of GPUs</label>
+      <input id="gpus" type="number" min="1" value="8" inputmode="numeric">
+    </div>
+    <div>
+      <label for="type">GPU type (list $/hr — edit to yours)</label>
+      <select id="type">
+        <option value="2.50">H100 — $2.50/hr</option>
+        <option value="3.50">H200 — $3.50/hr</option>
+        <option value="1.80" selected>A100 80GB — $1.80/hr</option>
+        <option value="1.30">A100 40GB — $1.30/hr</option>
+        <option value="1.10">L40S — $1.10/hr</option>
+        <option value="0.70">L4 — $0.70/hr</option>
+        <option value="custom">Custom…</option>
+      </select>
+    </div>
+    <div id="customWrap" style="display:none">
+      <label for="price">Custom price ($/GPU-hour)</label>
+      <input id="price" type="number" min="0" step="0.01" value="1.80" inputmode="decimal">
+    </div>
+    <div>
+      <label for="hours">Allocated hours/day <small>(24 = always-on)</small></label>
+      <input id="hours" type="number" min="1" max="24" value="24" inputmode="numeric">
+    </div>
+  </div>
+  <div style="margin-top:1rem">
+    <label for="util">Average GPU utilization: <span id="utilLabel" class="range-val">30%</span></label>
+    <div class="range-row">
+      <input id="util" type="range" min="1" max="100" value="30">
+    </div>
+    <label for="target" style="margin-top:.8rem">Target utilization after optimizing: <span id="targetLabel" class="range-val">70%</span></label>
+    <div class="range-row">
+      <input id="target" type="range" min="10" max="100" value="70">
+    </div>
+  </div>
+
+  <div class="headline" id="headline"></div>
+
+  <div class="out">
+    <div class="stat"><div class="k">Monthly GPU spend</div><div class="v" id="mSpend">–</div></div>
+    <div class="stat"><div class="k">Wasted on idle / month</div><div class="v waste" id="mWaste">–</div></div>
+    <div class="stat"><div class="k">Wasted on idle / year</div><div class="v waste" id="yWaste">–</div></div>
+    <div class="stat"><div class="k">Effective $/useful GPU-hr</div><div class="v" id="effHr">–</div></div>
+  </div>
+  <p style="margin-top:1rem"><small>List prices are editable — plug in your real negotiated / cloud rate. Math &amp; assumptions below.</small></p>
+</section>
+
+<div class="cta">
+  <strong>Seeing the waste is step one. Reclaiming it is step two.</strong>
+  <p class="muted" style="margin:.4rem 0 0">These copy-paste Kubernetes packs turn this number down — measure per-GPU utilization, then share/partition/reclaim idle GPUs:</p>
+  <a href="https://probizgen.gumroad.com/l/xxnqbt" rel="noopener">GPU Monitoring Pack — see the idle 70% →</a>
+  <a href="https://probizgen.gumroad.com" rel="noopener">GPU Cost-Optimization Pack — reclaim it →</a>
+</div>
+
+<h2>Why idle GPUs are the biggest line item nobody watches</h2>
+<p>A GPU costs the same whether it's running at 100% or sitting at 0% — you pay for the <em>allocation</em>, not the work. So utilization is a direct multiplier on your real cost. Run a fleet at 30% average utilization and you're paying <strong>3.3×</strong> per useful GPU-hour versus a fleet at 100%. Across a rack of H100s that's tens of thousands of dollars a month evaporating on cards that are allocated, powered, billed — and idle.</p>
+
+<h2>How the math works</h2>
+<table>
+<tr><th>Value</th><th>Formula</th></tr>
+<tr><td>Monthly spend</td><td>GPUs × $/hr × hours/day × 30.4</td></tr>
+<tr><td>Wasted on idle</td><td>Monthly spend × (1 − utilization)</td></tr>
+<tr><td>Effective $/useful hr</td><td>$/hr ÷ utilization</td></tr>
+<tr><td>Reclaimable savings</td><td>Annual spend × (1 − current ÷ target utilization)</td></tr>
+</table>
+<p class="muted"><small>Reclaimable savings model the fact that doing the same useful work at a higher utilization needs proportionally fewer GPUs. It's a planning estimate, not a guarantee — real savings depend on workload shape.</small></p>
+
+<h2>How teams actually cut it</h2>
+<ul>
+<li><strong>Measure per-GPU utilization</strong> — DCGM → Prometheus → Grafana, per card, per pod. You can't cut what you can't see.</li>
+<li><strong>Share GPUs</strong> for dev/notebooks/light inference (time-slicing) or <strong>partition</strong> them (MIG) so small models stop eating whole cards.</li>
+<li><strong>Cap hoarding</strong> with per-namespace GPU quotas.</li>
+<li><strong>Run interruptible work on spot</strong> nodes (60–90% cheaper).</li>
+<li><strong>Reclaim idle allocated GPUs</strong> automatically instead of hoping someone notices.</li>
+</ul>
+
+<h2>FAQ</h2>
+<p><strong>How much do idle GPUs cost?</strong><br>An idle H100 (~$2.50/hr) burns ~$1,800/month at 0% utilization. At 30% fleet utilization, ~70% of your GPU bill is paying for idle time.</p>
+<p><strong>What's a good GPU utilization target?</strong><br>Most fleets sit at 20–40%. Getting to 60–70% typically cuts the bill 30–60% for the same work.</p>
+<p><strong>How do I reduce Kubernetes GPU costs?</strong><br>Measure utilization, share/partition GPUs, quota them, use spot for interruptible jobs, and auto-reclaim idle allocations.</p>
+
+<footer>
+<p>Built by an AI-infrastructure engineer who runs GPU/K8s clusters. Free tool, no signup, nothing tracked. Prices are editable list rates — use your own.</p>
+<p>Part of the GPU/Kubernetes toolkit: <a href="https://probizgen.gumroad.com" rel="noopener">Monitoring · vLLM serving · Cost optimization</a>.</p>
+</footer>
+</div>
+
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id)};
+  var typeSel=$('type'),customWrap=$('customWrap'),priceInp=$('price');
+  function price(){ return typeSel.value==='custom' ? parseFloat(priceInp.value)||0 : parseFloat(typeSel.value); }
+  function fmt(n){ return '$'+Math.round(n).toLocaleString('en-US'); }
+  function fmt2(n){ return '$'+n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+  function calc(){
+    var g=Math.max(0,parseFloat($('gpus').value)||0);
+    var p=Math.max(0,price());
+    var h=Math.min(24,Math.max(0,parseFloat($('hours').value)||0));
+    var u=Math.min(100,Math.max(1,parseInt($('util').value)))/100;
+    var t=Math.min(100,Math.max(10,parseInt($('target').value)))/100;
+    $('utilLabel').textContent=Math.round(u*100)+'%';
+    $('targetLabel').textContent=Math.round(t*100)+'%';
+    var monthly=g*p*h*30.4;
+    var waste=monthly*(1-u);
+    var yWaste=waste*12;
+    var eff = u>0 ? p/u : 0;
+    var save = t>u ? monthly*12*(1-(u/t)) : 0;
+    $('mSpend').textContent=fmt(monthly);
+    $('mWaste').textContent=fmt(waste);
+    $('yWaste').textContent=fmt(yWaste);
+    $('effHr').textContent=fmt2(eff)+' ('+(u>0?(1/u).toFixed(1):'∞')+'×)';
+    var hl=$('headline');
+    if(save>0){
+      hl.innerHTML='At '+Math.round(u*100)+'% utilization you waste <b>'+fmt(yWaste)+'/yr</b> on idle GPUs. '+
+        'Lifting to '+Math.round(t*100)+'% would save about <b>'+fmt(save)+'/yr</b>.';
+    } else {
+      hl.innerHTML='At '+Math.round(u*100)+'% utilization you waste <b>'+fmt(yWaste)+'/yr</b> on idle GPUs.';
+    }
+  }
+  typeSel.addEventListener('change',function(){ customWrap.style.display = typeSel.value==='custom'?'block':'none'; calc(); });
+  ['gpus','price','hours','util','target'].forEach(function(id){ $(id).addEventListener('input',calc); });
+  calc();
+})();
+</script>
+</body>
+</html>
