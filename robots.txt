@@ -1,3 +1,3 @@
 User-agent: *
 Allow: /
-Sitemap: https://amihai4by.github.io/gpu-idle-cost-calculator/sitemap.xml
+Sitemap: https://gpu-cost.altostratus.biz/sitemap.xml

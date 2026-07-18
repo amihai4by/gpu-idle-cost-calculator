@@ -1,6 +1,6 @@
 # GPU Idle-Cost Calculator 💸
 
-**[→ Open the calculator](https://amihai4by.github.io/gpu-idle-cost-calculator/)** — free, no signup.
+**[→ Open the calculator](https://gpu-cost.altostratus.biz/)** — free, no signup.
 
 Most Kubernetes GPU fleets waste **60–70% of their spend** on allocated-but-idle
 cards. This is a tiny, single-page tool that turns that into a number: enter your
