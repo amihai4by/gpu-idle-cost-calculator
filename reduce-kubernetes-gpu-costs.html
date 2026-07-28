@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to Reduce Kubernetes GPU Costs — 2026 Guide (with the numbers)</title>
+<meta name="description" content="A practical 2026 guide to cutting Kubernetes GPU costs: measure utilization, share GPUs with time-slicing, partition with MIG, quota, spot nodes, and reclaim idle allocations — with the math on how much each saves.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/reduce-kubernetes-gpu-costs.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="How to Reduce Kubernetes GPU Costs — 2026 Guide">
+<meta property="og:description" content="Most GPU fleets waste 60–70% of spend on idle cards. Here's the practical playbook to cut it — measure, share, partition, quota, spot, reclaim.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/reduce-kubernetes-gpu-costs.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="How to Reduce Kubernetes GPU Costs — 2026 Guide">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "How to Reduce Kubernetes GPU Costs — 2026 Guide",
+  "description": "A practical playbook for cutting Kubernetes GPU costs: measure utilization, time-slicing, MIG, quotas, spot nodes, and idle reclamation.",
+  "author": {"@type": "Person", "name": "Altostratus — AI-infrastructure engineering"},
+  "mainEntityOfPage": "https://gpu-cost.altostratus.biz/reduce-kubernetes-gpu-costs.html"
+}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+table{width:100%;border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.5rem;border-bottom:1px solid var(--border);font-size:.95rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>How to Reduce Kubernetes GPU Costs (2026 Guide)</h1>
+<p class="lead">Most Kubernetes GPU fleets waste <strong>60–70% of their spend</strong> on cards that are allocated, powered, billed — and idle. This is the practical playbook for getting that back, in the order that pays off fastest.</p>
+
+<div class="box">💡 Want your fleet's number first? The <a href="/">free GPU Idle-Cost Calculator</a> shows how much you're wasting per year and what you'd reclaim by raising utilization. Two minutes, no signup.</div>
+
+<h2>Why utilization is the only number that matters</h2>
+<p>A GPU costs the same whether it runs at 100% or sits at 0% — you pay for the <em>allocation</em>, not the work. So utilization is a direct multiplier on real cost. A fleet averaging 30% utilization pays roughly <strong>3.3× per useful GPU-hour</strong> versus one kept busy. On a rack of H100s that's five figures a month evaporating quietly. Every optimization below is really just a way to push that utilization number up.</p>
+
+<h2>1. Measure per-GPU utilization (you can't cut what you can't see)</h2>
+<p>Before anything else, get per-card, per-pod visibility: <strong>DCGM exporter → Prometheus → Grafana</strong>. The metric that matters isn't average GPU busy-ness — it's <em>allocated-but-idle</em>: GPUs holding a reservation while doing nothing. That's where the leak is, and standard cluster monitoring won't show it. Also watch XID/ECC errors and thermal throttling, which quietly waste compute you're paying for.</p>
+
+<h2>2. Share GPUs with time-slicing (the biggest quick win)</h2>
+<p>Dev notebooks, CI, and light inference rarely need a whole GPU — but the scheduler hands them one anyway. <strong>Time-slicing</strong> (via the NVIDIA GPU Operator) advertises one physical GPU as N schedulable units, so many pods share a card. For interruption-tolerant, fractional workloads this is often a 2–4× density win overnight. The tradeoff: no hard memory isolation between pods — use it for dev/bursty/light inference, not for isolated production tenants.</p>
+
+<h2>3. Partition with MIG (isolation for production)</h2>
+<p>When you need real isolation, <strong>MIG (Multi-Instance GPU)</strong> hard-partitions an A100/H100 into up to seven independent slices, each with its own memory and compute. A single 80GB card becomes seven GPUs, so small models stop wasting whole cards. Profile names are GPU-specific — list them with <code>nvidia-smi mig -lgip</code>.</p>
+
+<h2>4. Cap hoarding with quotas</h2>
+<p>Nothing wastes GPUs like a team that grabs eight and uses two. A per-namespace <strong>ResourceQuota</strong> on <code>nvidia.com/gpu</code> plus a <strong>LimitRange</strong> default stops silent hoarding and forces teams to right-size.</p>
+
+<h2>5. Run interruptible work on spot nodes</h2>
+<p>Batch inference, checkpointed training, and CI are interruption-tolerant — perfect for <strong>spot/preemptible GPU nodes</strong> at 60–90% off on-demand. The pattern that makes it safe: a spot-only node pool, a low PriorityClass for interruptible work, consolidation enabled, and in-app checkpointing so a reclaim costs progress, not a restart from zero.</p>
+
+<h2>6. Reclaim idle allocations automatically</h2>
+<p>The last 30% is the allocated-but-idle GPUs nobody notices — the stuck notebook, the finished job that never released. Don't rely on someone spotting them: run a job that reads your DCGM utilization metric, flags GPUs under ~5% for hours, and (opt-in) reclaims them. Track reclaimed idle-GPU-hours × your $/GPU-hr as hard savings — that number is how the whole effort pays for itself.</p>
+
+<h2>How much can you actually save?</h2>
+<table>
+<tr><th>Lever</th><th>Typical effect</th></tr>
+<tr><td>Time-slicing dev/CI/light-inference</td><td>2–4× density on those workloads</td></tr>
+<tr><td>MIG on small production models</td><td>up to 7× on under-utilized cards</td></tr>
+<tr><td>Spot for interruptible work</td><td>60–90% off that compute</td></tr>
+<tr><td>Idle reclamation</td><td>recover the leaked 30–70%</td></tr>
+</table>
+<p>Getting a fleet from ~30% to ~70% average utilization typically cuts the GPU bill <strong>30–60% for the same useful work</strong>. <a href="/">Run your fleet's numbers here.</a></p>
+
+<div class="cta">
+Copy-paste Kubernetes packs that implement everything above — schema-validated, ~15 minutes to deploy:<br>
+→ <a href="https://probizgen.gumroad.com/l/xxnqbt">GPU Monitoring Pack</a> (see the idle 70%) &nbsp;·&nbsp; <a href="https://probizgen.gumroad.com">GPU Cost-Optimization Pack</a> (time-slicing · MIG · spot · idle-reaper)
+</div>
+
+<footer>
+Written by an AI-infrastructure engineer who runs GPU/K8s clusters. Free tools, no signup: the <a href="/">idle-cost calculator</a> and a <a href="https://github.com/amihai4by/gpu-healthcheck">GPU fleet health-check</a>.
+<br>Not affiliated with NVIDIA. MIG/time-slicing require the NVIDIA GPU Operator; profile names are GPU-specific.
+</footer>
+</article>
+</div>
+</body>
+</html>
