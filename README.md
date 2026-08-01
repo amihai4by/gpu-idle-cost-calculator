@@ -19,7 +19,7 @@ budgets quietly leak.
 - **Quota** to stop hoarding · **Spot** for interruptible work · **Reclaim** idle allocations
 
 Copy-paste Kubernetes packs that do each of these:
-- [GPU Monitoring Starter Pack](https://probizgen.gumroad.com/l/xxnqbt) — see the idle 70%
+- [GPU Monitoring Starter Pack](https://probizgen.gumroad.com/l/GPUMonitoringStarterPack) — see the idle 70%
 - [GPU Cost-Optimization Pack + Production vLLM Serving](https://probizgen.gumroad.com)
 
 ## Keywords
