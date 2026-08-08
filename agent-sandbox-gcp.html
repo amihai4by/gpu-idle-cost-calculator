@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>We gave an autonomous AI agent a shell for 270 turns — what actually held it</title>
+<meta name="description" content="A field report from containing a genuinely autonomous AI agent on GCP: the CDN-CIDR egress leak, why blocking the metadata server kills DNS, the token an agent can mint, and how to prove containment holds.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/agent-sandbox-gcp.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="We gave an autonomous AI agent a shell for 270 turns — what actually held it">
+<meta property="og:description" content="Everyone's shipping agents. Almost nobody can answer: what exactly can it reach, and how do you know? Three traps from containing a real autonomous agent on GCP.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/agent-sandbox-gcp.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="We gave an autonomous AI agent a shell for 270 turns">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "We gave an autonomous AI agent a shell for 270 turns — what actually held it",
+  "description": "Three traps from containing a genuinely autonomous AI agent on GCP: the CDN-CIDR egress leak, the metadata-server-is-DNS trap, the token an agent can mint, and how to prove containment holds.",
+  "author": {"@type": "Person", "name": "Altostratus — AI-infrastructure engineering"},
+  "mainEntityOfPage": "https://gpu-cost.altostratus.biz/agent-sandbox-gcp.html"
+}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>We gave an autonomous AI agent a shell, an API key, and a budget for 270 turns. Here's what actually held it.</h1>
+<p class="lead">Most of the "agent security" discourse right now is code review — people reading each other's tool-call loops and arguing about prompt injection. Useful, but it skips the question a platform team actually has to answer before any of this ships.</p>
+
+<p><strong>You're about to give an AI agent a real shell, real credentials, and a budget. What exactly can it reach — and how do you know?</strong></p>
+
+<p>We ran the experiment instead of theorizing about it. We put a genuinely autonomous agent — shell execution, file I/O, ~90 tools — inside a locked-down GCP project and let it run for 270 turns with a task, a key, and money to spend. Then we watched what it did, and, more importantly, what it <em>couldn't</em> do. Here are the parts that surprised us.</p>
+
+<h2>Trap 1: a "deny-all" egress allowlist that returns HTTP 200 to example.com</h2>
+<p>You allowlist your LLM provider so the agent can actually work:</p>
+<pre><code>api.openai.com  → 162.159.140.245, 172.66.0.243   (Cloudflare)</code></pre>
+<p>Then you test your deny-all from inside the sandbox with a site you <em>didn't</em> allow:</p>
+<pre><code>curl https://example.com   →   HTTP 200</code></pre>
+<p>That looks exactly like a broken firewall. It isn't. <code>example.com</code> resolves into the <em>same</em> Cloudflare <code>/13</code> ranges as <code>api.openai.com</code>. The moment you allowlisted your provider by IP CIDR, you allowed every other Cloudflare-fronted site on the internet — which today is a large fraction of it.</p>
+<p>The fix isn't a tighter CIDR (there isn't one — the ranges are shared). It's allowlisting by <strong>hostname through an egress proxy</strong>, not by IP. If your agent-sandbox story is "we allow the provider's IP ranges," your deny-all is decorative.</p>
+
+<h2>Trap 2: block the metadata server and you kill all DNS</h2>
+<p>The obvious hardening step: stop the agent from reaching the GCE metadata server at <code>169.254.169.254</code>. An agent with a shell can <code>curl</code> its own OAuth token from there and — with the default service account — start creating VMs on your quota.</p>
+<p>So you block it. And suddenly the container can't resolve <em>anything</em>, and you spend an hour convinced the image is broken.</p>
+<p>On GCE, the metadata server <strong>is</strong> the DNS resolver. Block it naively and you've cut your own DNS. The correct shape is a port-53 carve-out to the metadata IP <em>before</em> the deny rule, so DNS survives while the token endpoint stays unreachable. The ordering is the whole trick, and you only learn it by breaking it.</p>
+
+<h2>Trap 3: the token you forgot the agent could mint</h2>
+<p>Related, and worse: even without a human handing it credentials, an agent with a shell and the default service account can mint an access token from the metadata endpoint and act as that identity. If that SA has project-level permissions — which is the default — your "sandboxed" agent can create infrastructure, read buckets, and spend money, none of which shows up in its transcript as a "dangerous tool call." It never used a tool. It used <code>curl</code>.</p>
+<p>Containment here isn't a prompt or a tool policy. It's a bounded service account plus an egress rule that the agent's own root shell can't flush — because any <code>iptables</code> rule <em>inside</em> the guest can be flushed by the thing you're containing. The rule has to live in the VPC, outside the guest.</p>
+
+<h2>How we proved it held: the agent's own recon came back empty</h2>
+<p>The point of all this isn't the config — everyone ships Terraform. The point is <strong>proof</strong>. We ran a <code>verify-isolation</code> script: 10 checks with a hard exit 0/1 — off-allowlist egress blocked, metadata token unreachable from the container, service-account privilege bounded, no host bind mounts, no inbound path. CI-safe. The output pastes into a change ticket and ends the security conversation in one screen.</p>
+<p>The most telling result wasn't ours. The agent, unprompted, ran its own reconnaissance script to map what it could reach. The network section of its report came back empty. It spent 270 turns inside a box and never knew the box was a box.</p>
+
+<h2>Why this matters now</h2>
+<p>Everyone is shipping agents. Almost nobody can answer the security team's one question with evidence rather than assurances. The gap between "we wrote a firewall" and "here's a script that proves what it can reach, exit 0" is exactly where these deployments stall — and it's a gap you can close in an afternoon if you know the three traps above.</p>
+
+<div class="cta">Want to see where your own setup leaks first? The <a href="https://github.com/amihai4by/gpu-healthcheck">free infra health-check</a> is a good start. The full containment — dedicated GCP project, VPC-enforced egress deny-all, the <code>verify-isolation.sh</code> script, and a <code>FINDINGS.md</code> of the nine traps that cost real debugging time — ships as the <a href="https://probizgen.gumroad.com">Agent Sandbox Pack for GCP</a>.</div>
+
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your agents and your GPUs behave in production.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/reduce-kubernetes-gpu-costs.html">Reduce Kubernetes GPU Costs (guide)</a></p>
+</footer>
+</article>
+</div>
+</body>
+</html>
