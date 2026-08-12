@@ -76,6 +76,18 @@ footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);col
 
 <div class="cta">Want to see where your own setup leaks first? The <a href="https://github.com/amihai4by/gpu-healthcheck">free infra health-check</a> is a good start. The full containment — dedicated GCP project, VPC-enforced egress deny-all, the <code>verify-isolation.sh</code> script, and a <code>FINDINGS.md</code> of the nine traps that cost real debugging time — ships as the <a href="https://probizgen.gumroad.com/l/AgentSandboxGCP">Agent Sandbox Pack for GCP ($59)</a>.</div>
 
+<div class="box">
+<strong>Get the next field note.</strong> Occasional, practical notes on GPU &amp; AI-agent infrastructure — the traps, the fixes, the numbers. No spam, unsubscribe anytime.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'agent-sandbox-writeup'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+
 <footer>
 <p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your agents and your GPUs behave in production.</p>
 <p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/reduce-kubernetes-gpu-costs.html">Reduce Kubernetes GPU Costs (guide)</a></p>
