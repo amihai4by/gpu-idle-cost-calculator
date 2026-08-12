@@ -83,6 +83,18 @@ Copy-paste Kubernetes packs that implement everything above — schema-validated
 → <a href="https://probizgen.gumroad.com/l/GPUMonitoringStarterPack">GPU Monitoring Pack</a> (see the idle 70%) &nbsp;·&nbsp; <a href="https://probizgen.gumroad.com/l/GPUCost-OptimizationPack">GPU Cost-Optimization Pack</a> (time-slicing · MIG · spot · idle-reaper)
 </div>
 
+<div style="margin:1.5rem 0;padding:1rem 1.2rem;border:1px solid var(--border,#e2e6ea);border-radius:12px;background:var(--card,#f6f8fa)">
+<strong>Get the next field note.</strong> Practical, occasional notes on GPU/K8s cost + AI-agent infrastructure &mdash; the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border,#e2e6ea);border-radius:8px;background:var(--bg,#fff);color:var(--fg,#1a1a1a);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent,#00afa9);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted,#5e5e5f)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'gpu-cost-guide'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+
 <footer>
 Written by an AI-infrastructure engineer who runs GPU/K8s clusters. Free tools, no signup: the <a href="/">idle-cost calculator</a> and a <a href="https://github.com/amihai4by/gpu-healthcheck">GPU fleet health-check</a>.
 <br>Not affiliated with NVIDIA. MIG/time-slicing require the NVIDIA GPU Operator; profile names are GPU-specific.

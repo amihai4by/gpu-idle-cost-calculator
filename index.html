@@ -170,6 +170,18 @@ a{color:var(--accent)}
 <p><strong>What's a good GPU utilization target?</strong><br>Most fleets sit at 20–40%. Getting to 60–70% typically cuts the bill 30–60% for the same work.</p>
 <p><strong>How do I reduce Kubernetes GPU costs?</strong><br>Measure utilization, share/partition GPUs, quota them, use spot for interruptible jobs, and auto-reclaim idle allocations.</p>
 
+<div style="max-width:760px;margin:1.5rem auto;padding:1rem 1.2rem;border:1px solid var(--border,#e2e6ea);border-radius:12px;background:var(--card,#f6f8fa);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:var(--fg,#1a1a1a)">
+<strong>Get the occasional field note.</strong> Practical notes on GPU &amp; AI-agent infrastructure. The calculator itself is free and needs no signup &mdash; this is only if you want more.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border,#e2e6ea);border-radius:8px;background:var(--bg,#fff);color:var(--fg,#1a1a1a);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent,#00afa9);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted,#5e5e5f)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'calculator'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+
 <footer>
 <p>Built by an AI-infrastructure engineer who runs GPU/K8s clusters. Free tool, no signup, nothing tracked. Prices are editable list rates — use your own.</p>
 <p>Part of the GPU/Kubernetes toolkit: <a href="https://probizgen.gumroad.com" rel="noopener">Monitoring · vLLM serving · Cost optimization</a>.</p>
