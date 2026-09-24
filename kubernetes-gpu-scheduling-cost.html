@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kubernetes GPU Scheduling &amp; Why Your Cluster Is 30–50% Idle</title>
+<meta name="description" content="A GPU bills at 100% whether it runs at 100% or 0%. Why Kubernetes GPU clusters typically sit 30–50% idle — fragmentation, time-slicing vs MIG, taints/tolerations, and queue fragmentation in Run:AI/Slurm — and how to fix it.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/kubernetes-gpu-scheduling-cost.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Kubernetes GPU Scheduling & Why Your Cluster Is 30–50% Idle">
+<meta property="og:description" content="Idle GPUs bill at 100%. The scheduling reasons clusters sit 30–50% idle — fragmentation, time-slicing vs MIG, taints, queue fragmentation — and how to reclaim it.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/kubernetes-gpu-scheduling-cost.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Kubernetes GPU Scheduling & Why Your Cluster Is 30–50% Idle">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "Kubernetes GPU Scheduling & Why Your Cluster Is 30–50% Idle",
+  "description": "The scheduling reasons Kubernetes GPU clusters sit 30–50% idle — fragmentation, time-slicing vs MIG, taints/tolerations, queue fragmentation in Run:AI/Slurm — and how idle GPUs bill at 100%.",
+  "author": {"@type": "Person", "name": "Altostratus — AI-infrastructure engineering"},
+  "mainEntityOfPage": "https://gpu-cost.altostratus.biz/kubernetes-gpu-scheduling-cost.html"
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type":"Question","name":"Why is my Kubernetes GPU cluster idle if all GPUs are allocated?","acceptedAnswer":{"@type":"Answer","text":"Because Kubernetes schedules whole GPUs by default. A pod that requests one GPU but uses a fraction still reserves the entire card, so 'fully allocated' and 'fully utilized' are different numbers. The gap between them — often 30–50% — is idle capacity you're still paying for."}},
+    {"@type":"Question","name":"What is the difference between GPU time-slicing and MIG?","acceptedAnswer":{"@type":"Answer","text":"Time-slicing lets multiple pods share one physical GPU by taking turns on it, with no hard memory isolation — good for dev, CI, and light inference. MIG (Multi-Instance GPU) hard-partitions a supported GPU into isolated slices, each with its own memory and compute — good for production tenants that need isolation."}},
+    {"@type":"Question","name":"Does an idle GPU still cost money?","acceptedAnswer":{"@type":"Answer","text":"Yes. You pay for the allocation, not the work. A reserved GPU bills at the same rate whether it runs at 100% or 0%, which is why raising utilization — not buying more cards — is the primary cost lever."}}
+  ]
+}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}h3{font-size:1.12rem;margin-top:1.6rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+table{width:100%;border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.5rem;border-bottom:1px solid var(--border);font-size:.95rem}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>Kubernetes GPU Scheduling: Why Your Cluster Is 30–50% Idle (and Billing at 100%)</h1>
+<p class="lead">Here's the uncomfortable arithmetic of GPU infrastructure: <strong>a GPU costs exactly the same whether it runs at 100% or sits at 0%</strong>. You pay for the allocation, not the work. And Kubernetes, left to its defaults, allocates GPUs in a way that leaves a large fraction of them reserved-but-idle. Typical fleets run at 30–50% utilization — meaning half your GPU budget can be evaporating on cards nobody is using. This is why, and what to do about it.</p>
+
+<div class="box">💡 Put a number on it first: the <a href="/">free GPU Idle-Cost Calculator</a> turns fleet size + utilization into an annual waste figure. Two minutes, no signup.</div>
+
+<h2>The root cause: Kubernetes schedules whole GPUs</h2>
+<p>By default, <code>nvidia.com/gpu</code> is an <em>integer</em> resource. A pod requests <code>1</code>, and the scheduler hands it an entire physical GPU — a Jupyter notebook, a small inference service, a CI job, all get a whole card whether they need 5% of it or 95%. So "the cluster is fully allocated" and "the cluster is fully utilized" become two very different numbers, and the gap between them is pure waste that still shows up on the invoice. Everything below is a way to close that gap.</p>
+
+<h2>Fragmentation: the idle you can't schedule around</h2>
+<p>The second driver is <strong>fragmentation</strong>, and it's subtler. Suppose each node has 8 GPUs and jobs land unevenly — a few 1-GPU pods scattered across several nodes leave, say, 3 free GPUs on this node and 2 on that one. Now an 8-GPU training job arrives and <em>cannot schedule</em>, even though the cluster has 5+ GPUs free, because they're not contiguous on one node. The free capacity is real and billed, but unusable. Multi-GPU and multi-node jobs make this worse: the more your workloads need co-located GPUs, the more scattered singletons strand capacity. Bin-packing scheduling policy (pack onto the fewest nodes) instead of spreading helps, as does keeping interactive/singleton work off the nodes reserved for large jobs.</p>
+
+<h2>Sharing a GPU: time-slicing vs MIG</h2>
+<p>If whole-GPU allocation is the problem, GPU sharing is the primary fix — and there are two mechanisms with different tradeoffs.</p>
+<h3>Time-slicing</h3>
+<p>Via the NVIDIA GPU Operator, <strong>time-slicing</strong> advertises one physical GPU as N schedulable units; pods take turns on the card. There's <em>no hard memory or fault isolation</em> — one pod can starve or OOM the others — so it's ideal for <strong>dev notebooks, CI, and light/bursty inference</strong>, where a 2–4× density gain on those workloads is common. It is the wrong tool for isolated production tenants.</p>
+<h3>MIG (Multi-Instance GPU)</h3>
+<p>On supported data-center GPUs, <strong>MIG</strong> hard-partitions a card into independent slices, each with its own memory and compute — real isolation. A large card becomes several smaller "GPUs," so small production models stop consuming whole cards. Profiles are GPU-specific; list them with <code>nvidia-smi mig -lgip</code>. The rule of thumb: <strong>time-slice for dev and elastic workloads, MIG for isolated production.</strong></p>
+
+<h2>Taints, tolerations, and reserved pools that sit empty</h2>
+<p>A common self-inflicted idle source: dedicating a GPU node pool to one team or one workload with taints, then that workload underuses it while <em>other</em> teams queue for GPUs elsewhere. Taints are the right tool for protecting large-job nodes from interactive clutter — but a taint that reserves capacity for demand that isn't there is just idle you've fenced off. Audit your taints against actual utilization: a reserved pool at 20% is more expensive than a shared one at 70%.</p>
+<pre><code>kubectl describe nodes | grep -i -e taint -e nvidia.com/gpu</code></pre>
+
+<h2>Queue fragmentation in Run:AI, Slurm, and gang scheduling</h2>
+<p>Higher-level schedulers — <strong>Run:AI, Slurm, Volcano/Kueue</strong> — add fair-share quotas and gang scheduling on top of Kubernetes, which is exactly what large GPU fleets need. But they introduce their own idle mode: <strong>queue fragmentation</strong>. When capacity is carved into per-team or per-project quotas, Team A's jobs can be queued and waiting while Team B's reserved GPUs sit idle — the cluster is idle and backlogged at the same time. The fixes are policy, not hardware: enable <strong>quota borrowing / preemption</strong> so idle reserved capacity is lent to queued work, use <strong>gang scheduling</strong> so multi-GPU jobs don't half-schedule and strand partial allocations, and set fair-share so reclamation is automatic rather than a Slack argument.</p>
+
+<h2>The last mile: allocated-but-idle GPUs nobody notices</h2>
+<p>Even with sharing and good scheduling policy, the final slice of waste is the <strong>stuck allocation</strong>: the notebook someone left open over the weekend, the finished job that never released its GPU, the crashed process still holding the card. These don't show up in "GPUs allocated" as a problem — they show up as full allocation with near-zero utilization. You catch them by reading per-GPU utilization from <strong>DCGM → Prometheus</strong>, flagging cards under ~5% for hours, and (opt-in) reclaiming them. Tracking reclaimed idle-GPU-hours × your $/GPU-hour is how the whole effort proves its own value.</p>
+
+<h2>What to actually measure</h2>
+<table>
+<tr><th>Metric</th><th>Why it matters</th></tr>
+<tr><td>Allocated vs. utilized GPUs</td><td>The core gap — this is the waste</td></tr>
+<tr><td>Per-GPU utilization (DCGM)</td><td>Finds allocated-but-idle cards</td></tr>
+<tr><td>Unschedulable multi-GPU jobs</td><td>Signals fragmentation</td></tr>
+<tr><td>Queue wait time vs. idle reserved GPUs</td><td>Signals queue fragmentation</td></tr>
+<tr><td>Reserved-pool utilization</td><td>Exposes taints fencing off idle</td></tr>
+</table>
+<p>Getting a fleet from ~30% to ~70% average utilization typically cuts the GPU bill 30–60% <em>for the same useful work</em> — no new hardware, no quality tradeoffs, just scheduling and reclamation. That's why utilization, not capacity, is the number to chase.</p>
+
+<div class="cta">
+Start with the number: the <a href="/">free GPU Idle-Cost Calculator</a> shows what your current utilization is costing per year, in two minutes.<br><br>
+For a human to find the waste on <em>your</em> actual cluster — the fragmentation, the fenced-off pools, the stuck allocations, the quotas that never borrow — book a <a href="https://altostratus.biz/Audit">GPU Cost &amp; Reliability Audit →</a>
+</div>
+
+<div class="box">
+<strong>Get the next field note.</strong> Practical, occasional notes on GPU/K8s cost and scheduling — the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'gpu-scheduling-idle'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your GPUs behave in production.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/reduce-kubernetes-gpu-costs.html">Reduce Kubernetes GPU Costs</a> · <a href="/reduce-llm-inference-cost-kubernetes.html">Reduce LLM Inference Cost</a> · <a href="/nvidia-gpu-operator-not-detecting-gpus.html">GPU Operator not detecting GPUs</a></p>
+<p>Not affiliated with NVIDIA or Run:AI. MIG/time-slicing require the NVIDIA GPU Operator; profile and scheduler behavior varies by version and hardware.</p>
+</footer>
+</article>
+</div>
+<script>(function(){var T='https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/track';function b(t,x){try{fetch(T,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({type:t,page:location.pathname,ref:document.referrer||''},x||{})),keepalive:true})}catch(e){}}b('pageview');document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&a.href&&/gumroad\.com|amazon\.com|\/l\/|calendly|cal\.com|\/Audit/.test(a.href)){b('cta_click',{meta:{href:a.href}})}},true)})();</script>
+</body>
+</html>

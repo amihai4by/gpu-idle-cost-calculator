@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to Reduce LLM Inference Cost on Kubernetes — 2026 Playbook</title>
+<meta name="description" content="Inference is the majority of AI GPU spend. A practical playbook to cut LLM inference cost on Kubernetes: continuous batching, right-sizing replicas, KV-cache, quantization tradeoffs, spot nodes, and autoscaling on bursty traffic.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/reduce-llm-inference-cost-kubernetes.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="How to Reduce LLM Inference Cost on Kubernetes — 2026 Playbook">
+<meta property="og:description" content="Inference — not training — is where most AI GPU budget goes in 2026. The practical levers: continuous batching, right-sizing, KV-cache, quantization, spot, and autoscaling.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/reduce-llm-inference-cost-kubernetes.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="How to Reduce LLM Inference Cost on Kubernetes">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "How to Reduce LLM Inference Cost on Kubernetes — 2026 Playbook",
+  "description": "A practical playbook for cutting LLM inference cost on Kubernetes: continuous batching, right-sizing replicas, KV-cache management, quantization tradeoffs, spot nodes, and autoscaling on bursty traffic.",
+  "author": {"@type": "Person", "name": "Altostratus — AI-infrastructure engineering"},
+  "mainEntityOfPage": "https://gpu-cost.altostratus.biz/reduce-llm-inference-cost-kubernetes.html"
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type":"Question","name":"What is the biggest lever for reducing LLM inference cost?","acceptedAnswer":{"@type":"Answer","text":"Throughput per GPU. Continuous (in-flight) batching in a modern serving engine like vLLM or TGI keeps the GPU busy across many concurrent requests instead of one at a time, which is usually the single largest improvement in cost-per-token before you touch the model itself."}},
+    {"@type":"Question","name":"Does quantization reduce inference cost?","acceptedAnswer":{"@type":"Answer","text":"Yes — lower-precision weights (e.g. INT8/FP8/INT4) shrink memory footprint and can raise throughput, letting a model fit on smaller or fewer GPUs. The tradeoff is potential quality loss, so it must be validated on your own evals rather than assumed to be free."}},
+    {"@type":"Question","name":"Why is GPU utilization low for LLM inference?","acceptedAnswer":{"@type":"Answer","text":"Bursty traffic and over-provisioned replicas. If you size replicas for peak and traffic is spiky, GPUs sit idle between bursts while still billing at 100%. Request-aware autoscaling and consolidating low-traffic models onto shared GPUs recover most of that waste."}}
+  ]
+}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}h3{font-size:1.12rem;margin-top:1.6rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+table{width:100%;border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.5rem;border-bottom:1px solid var(--border);font-size:.95rem}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>How to Reduce LLM Inference Cost on Kubernetes</h1>
+<p class="lead">Training got the headlines; <strong>inference is where the money actually goes</strong>. A model is trained a handful of times and served millions. If your AI GPU bill is climbing, it's almost certainly your serving fleet — and most of that cost is recoverable without touching model quality. Here are the levers, in the order that usually pays off fastest.</p>
+
+<div class="box">💡 Want the number before the fixes? The <a href="/">free GPU Idle-Cost Calculator</a> shows what your current utilization is costing per year. Two minutes, no signup.</div>
+
+<h2>The one metric that governs cost: throughput per GPU</h2>
+<p>Inference cost reduces to a single ratio: <strong>tokens served per GPU-hour ÷ your $/GPU-hour</strong>. You lower cost either by raising the numerator (serve more tokens on the same card) or lowering the denominator (cheaper cards, spot). Everything below is one of those two moves. And because a GPU bills at 100% whether it's saturated or idle, the fastest wins come from raising throughput on hardware you're already paying for.</p>
+
+<h2>1. Continuous batching — the single biggest throughput win</h2>
+<p>Naive serving processes one request (or one static batch) at a time; the GPU stalls waiting for the slowest sequence to finish. A modern serving engine — <strong>vLLM, TGI, TensorRT-LLM</strong> — uses <strong>continuous (in-flight) batching</strong>: it admits new requests into the running batch as slots free up, so the GPU stays saturated across many concurrent users. For real, concurrent traffic this is typically the largest single improvement in cost-per-token you can make, and it's a serving-layer change — the model is untouched. If you're still serving LLMs from a hand-rolled Flask/FastAPI loop, this is where to start.</p>
+
+<h2>2. KV-cache: the hidden memory (and cost) driver</h2>
+<p>Every token of context is held in the <strong>KV-cache</strong>, and that memory — not the weights — usually dictates how many concurrent requests fit on a GPU. Two consequences for cost:</p>
+<ul>
+<li><strong>PagedAttention-style cache management</strong> (in vLLM and similar) packs the cache far more densely than contiguous allocation, raising the concurrency a single GPU can hold — directly more throughput per card.</li>
+<li><strong>Long contexts are expensive.</strong> KV-cache grows with context length × concurrency, so a service that lets every request carry a huge prompt quietly caps your batch size. Trimming context, enabling prefix caching for shared system prompts, and capping max sequence length are real cost levers, not just latency ones.</li>
+</ul>
+
+<h2>3. Quantization — fit more model on less GPU (with eyes open)</h2>
+<p>Serving weights at lower precision (<strong>FP8, INT8, INT4</strong> via AWQ/GPTQ and similar) shrinks the memory footprint and can raise throughput, which often lets a model drop to a smaller GPU or fewer of them — a direct cost cut. The honest tradeoff: quantization <em>can</em> degrade quality, and how much depends on the model and the method. Treat it as a change to validate, not a free win: <strong>run your own eval set before and after</strong> and decide with numbers. Done right it's one of the highest-leverage cost moves; done blindly it's a quality regression you'll discover in production.</p>
+
+<h2>4. Right-size the replica to the model</h2>
+<p>A frequent, silent waste: serving a model that fits comfortably on one GPU across a multi-GPU replica "for headroom," or reserving a whole 80GB card for a small model. Tensor/pipeline parallelism has real overhead — split a model across more GPUs than it needs and you pay in both idle capacity and communication cost. Right-sizing means: use the <em>fewest</em> GPUs the model and your latency target actually require, and pack small models onto shared or partitioned GPUs (see <a href="/kubernetes-gpu-scheduling-cost.html">MIG and time-slicing</a>) rather than giving each its own card.</p>
+
+<h2>5. Autoscale on the right signal for bursty traffic</h2>
+<p>Inference traffic is spiky, and this is where money leaks. If you provision replicas for peak, GPUs sit idle between bursts while billing at 100%. The fix is autoscaling — but CPU/memory HPA is the wrong signal for LLM serving. Scale on a request-aware metric instead: <strong>queue depth, requests/pending per replica, or a custom throughput metric</strong> exported from your serving engine, driven through KEDA or a custom-metrics HPA. Two caveats that make it safe:</p>
+<ul>
+<li><strong>Cold starts are slow</strong> — loading tens of GB of weights takes time, so keep a warm floor of replicas and scale <em>up</em> aggressively, <em>down</em> gently.</li>
+<li><strong>Scale-to-zero</strong> is viable for genuinely intermittent internal models, paired with a fast loader and an accepted first-request latency.</li>
+</ul>
+
+<h2>6. Cheaper GPU-hours: spot and the right accelerator</h2>
+<p>The denominator lever. Interruption-tolerant inference — async/batch scoring, offline generation, anything idempotent and retryable — runs well on <strong>spot/preemptible GPU nodes</strong> at a large discount, provided you handle preemption gracefully (fast drain, ret/requeue, a warm on-demand floor for latency-critical traffic). Separately, match the accelerator to the workload: the newest, largest GPU isn't always the cheapest per token for a small model, and a smaller card at high utilization can beat a big one at 30%.</p>
+
+<h2>Putting it together</h2>
+<table>
+<tr><th>Lever</th><th>What it moves</th><th>Watch out for</th></tr>
+<tr><td>Continuous batching</td><td>Throughput per GPU ↑↑</td><td>Requires a real serving engine</td></tr>
+<tr><td>KV-cache mgmt / prefix caching</td><td>Concurrency per GPU ↑</td><td>Long contexts cap batch size</td></tr>
+<tr><td>Quantization</td><td>Model fits smaller/fewer GPUs</td><td>Validate quality on your evals</td></tr>
+<tr><td>Right-sizing replicas</td><td>Removes idle/over-parallelism</td><td>Respect latency target</td></tr>
+<tr><td>Request-aware autoscaling</td><td>Kills between-burst idle</td><td>Cold starts; keep a warm floor</td></tr>
+<tr><td>Spot + right accelerator</td><td>$/GPU-hour ↓</td><td>Only interruption-tolerant work</td></tr>
+</table>
+<p>The pattern across all six: <strong>utilization is the multiplier</strong>. A serving fleet averaging 30% utilization is paying roughly 3× per useful token versus one kept busy. Fix batching and autoscaling first — they raise utilization without any model risk — then take the model-level wins (quantization, right-sizing) with your evals in hand.</p>
+
+<div class="cta">
+Start with the number: the <a href="/">free GPU Idle-Cost Calculator</a> turns your fleet size and utilization into an annual waste figure in two minutes.<br><br>
+And when you want a human to find the waste on <em>your</em> actual cluster — the idle replicas, the mis-sized models, the autoscaling that never fires — book a <a href="https://altostratus.biz/Audit">GPU Cost &amp; Reliability Audit →</a>
+</div>
+
+<div class="box">
+<strong>Get the next field note.</strong> Practical, occasional notes on GPU/K8s cost and AI-infra — the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'llm-inference-cost'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your GPUs and your inference bill behave in production.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/reduce-kubernetes-gpu-costs.html">Reduce Kubernetes GPU Costs</a> · <a href="/kubernetes-gpu-scheduling-cost.html">GPU Scheduling &amp; Idle Cost</a> · <a href="/nvidia-gpu-operator-not-detecting-gpus.html">GPU Operator not detecting GPUs</a></p>
+<p>Serving-engine names (vLLM, TGI, TensorRT-LLM) refer to their respective open-source projects. Behavior and features vary by version — validate against the versions you run.</p>
+</footer>
+</article>
+</div>
+<script>(function(){var T='https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/track';function b(t,x){try{fetch(T,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({type:t,page:location.pathname,ref:document.referrer||''},x||{})),keepalive:true})}catch(e){}}b('pageview');document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&a.href&&/gumroad\.com|amazon\.com|\/l\/|calendly|cal\.com|\/Audit/.test(a.href)){b('cta_click',{meta:{href:a.href}})}},true)})();</script>
+</body>
+</html>

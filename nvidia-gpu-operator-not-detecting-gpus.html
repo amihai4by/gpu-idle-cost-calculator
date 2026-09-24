@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NVIDIA GPU Operator Not Detecting GPUs on Kubernetes — Debugging Checklist</title>
+<meta name="description" content="Your Kubernetes nodes show 0 nvidia.com/gpu even though the hardware is there. A step-by-step debugging checklist: device plugin registration, driver/toolkit version skew, containerd RuntimeClass, node labels (NFD), and DCGM.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/nvidia-gpu-operator-not-detecting-gpus.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="NVIDIA GPU Operator Not Detecting GPUs on Kubernetes — Debugging Checklist">
+<meta property="og:description" content="nvidia.com/gpu is 0 but the card is physically there. The real checklist: device plugin registration, driver/toolkit skew, containerd RuntimeClass, NFD labels, DCGM.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/nvidia-gpu-operator-not-detecting-gpus.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="NVIDIA GPU Operator Not Detecting GPUs on Kubernetes">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "NVIDIA GPU Operator Not Detecting GPUs on Kubernetes — Debugging Checklist",
+  "description": "A step-by-step checklist for when nvidia.com/gpu shows 0 on your nodes: device plugin registration, driver/toolkit version skew, containerd RuntimeClass, NFD node labels, and DCGM.",
+  "author": {"@type": "Person", "name": "Altostratus — AI-infrastructure engineering"},
+  "mainEntityOfPage": "https://gpu-cost.altostratus.biz/nvidia-gpu-operator-not-detecting-gpus.html"
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type":"Question","name":"Why does kubectl show 0 nvidia.com/gpu even though the GPU is physically installed?","acceptedAnswer":{"@type":"Answer","text":"The node capacity is advertised by the NVIDIA device plugin, not by the kernel. If the device plugin pod isn't running, can't load the driver, or the container runtime isn't wired to nvidia-container-runtime, the node reports 0 allocatable GPUs even though nvidia-smi works on the host."}},
+    {"@type":"Question","name":"What is the most common cause of the GPU Operator failing to detect GPUs?","acceptedAnswer":{"@type":"Answer","text":"The two most common causes are (1) the container runtime not being configured to use nvidia-container-runtime as a RuntimeClass handler, and (2) driver/toolkit version skew — a container-toolkit or device-plugin version that doesn't match the installed driver. Node Feature Discovery not labeling the node with pci-10de is a frequent third."}},
+    {"@type":"Question","name":"How do I check if the NVIDIA device plugin registered the GPU?","acceptedAnswer":{"@type":"Answer","text":"Run kubectl describe node <node> and look under Capacity and Allocatable for nvidia.com/gpu. If it's missing or 0, check the device plugin pod logs in the gpu-operator namespace for driver-load or socket-registration errors."}}
+  ]
+}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}h3{font-size:1.12rem;margin-top:1.6rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+table{width:100%;border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.5rem;border-bottom:1px solid var(--border);font-size:.95rem}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>NVIDIA GPU Operator Not Detecting GPUs on Kubernetes: The Debugging Checklist</h1>
+<p class="lead">The card is physically in the node. <code>nvidia-smi</code> works on the host. But <code>kubectl describe node</code> shows <code>nvidia.com/gpu: 0</code>, your pod is stuck <code>Pending</code> with <em>Insufficient nvidia.com/gpu</em>, and you're paying for an accelerator Kubernetes refuses to see. This is the checklist that finds it, in the order that resolves it fastest.</p>
+
+<div class="box">💡 Idle GPUs cost the same as busy ones. Once the node is scheduling again, the <a href="/">free GPU Idle-Cost Calculator</a> shows what that fleet is actually wasting per year. Two minutes, no signup.</div>
+
+<h2>First, understand what actually advertises the GPU</h2>
+<p>Kubernetes does not discover GPUs from the kernel. Capacity is advertised by the <strong>NVIDIA device plugin</strong>, which registers with the kubelet over a socket and reports the <code>nvidia.com/gpu</code> extended resource. Behind it, the <strong>NVIDIA GPU Operator</strong> orchestrates a chain of components, and if any link is broken the node reports zero — even with perfectly healthy hardware. The chain is:</p>
+<p><strong>NFD labels the node → driver loads (host or Operator-managed) → container-toolkit rewrites the runtime → device plugin registers <code>nvidia.com/gpu</code> → DCGM exports metrics.</strong></p>
+<p>Debugging is just walking that chain until you find the broken link. Start here:</p>
+<pre><code>kubectl -n gpu-operator get pods
+kubectl describe node &lt;node&gt; | grep -A6 Capacity</code></pre>
+<p>If <code>nvidia.com/gpu</code> is absent or <code>0</code> under Capacity/Allocatable, keep going.</p>
+
+<h2>1. Node labels — is Node Feature Discovery seeing the card?</h2>
+<p>The Operator uses <strong>Node Feature Discovery (NFD)</strong> to find GPU nodes before it schedules anything onto them. If NFD never labeled the node, no operand lands there and detection silently never starts. Check for the PCI vendor label (NVIDIA is <code>0x10de</code>):</p>
+<pre><code>kubectl get node &lt;node&gt; -o jsonpath='{.metadata.labels}' | tr ',' '\n' | grep -i -e pci-10de -e nvidia</code></pre>
+<p>No <code>feature.node.kubernetes.io/pci-10de.present=true</code>? Confirm NFD is actually running (<code>kubectl -n gpu-operator get pods | grep nfd</code>), that the worker pcidevice is passed through (bare metal / passthrough VMs), and that a stray <code>nodeSelector</code> or taint isn't keeping NFD off the node.</p>
+
+<h2>2. The container runtime — the single most common cause</h2>
+<p>This is where most "0 GPUs" tickets actually end. Even with a loaded driver, a pod only gets a GPU if the container runtime invokes <strong>nvidia-container-runtime</strong>. On modern clusters that's wired through a <strong>RuntimeClass</strong> plus a containerd config edit. Two things must be true:</p>
+<h3>a. containerd must know the nvidia handler</h3>
+<p>Look in <code>/etc/containerd/config.toml</code> for the runtime handler the toolkit installs:</p>
+<pre><code>[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia]
+  runtime_type = "io.containerd.runc.v2"
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.nvidia.options]
+    BinaryName = "/usr/bin/nvidia-container-runtime"</code></pre>
+<p>If the container-toolkit pod edited the config but containerd was never restarted, the handler doesn't exist yet. Restarting containerd (or letting the toolkit do it) is a routine fix. Confirm the RuntimeClass object exists too: <code>kubectl get runtimeclass</code>.</p>
+<h3>b. the default runtime vs. an explicit RuntimeClass</h3>
+<p>Depending on how the Operator is installed, GPU pods either rely on <code>nvidia</code> being the <em>default</em> containerd runtime, or on each GPU pod carrying <code>runtimeClassName: nvidia</code>. A mismatch here — default runtime is still <code>runc</code>, pods don't set the RuntimeClass — means the GPU is never mounted into the container. Read the toolkit pod logs when in doubt:</p>
+<pre><code>kubectl -n gpu-operator logs -l app=nvidia-container-toolkit-daemonset</code></pre>
+
+<h2>3. Driver / toolkit / plugin version skew</h2>
+<p>The driver, container-toolkit, device plugin, and (if used) DCGM are a matched set. Skew — an Operator bundle that expects a newer driver than the one installed, or a host-installed driver too old for the CUDA image your workload uses — shows up as a device plugin that crash-loops or registers zero. Establish ground truth from the driver daemonset, not from memory:</p>
+<pre><code>kubectl -n gpu-operator exec ds/nvidia-driver-daemonset -- nvidia-smi
+kubectl -n gpu-operator logs ds/nvidia-driver-daemonset</code></pre>
+<p>Two rules keep you out of trouble: <strong>(1)</strong> decide up front whether the driver is host-managed or Operator-managed and don't run both — a pre-installed host driver with the Operator also trying to install one is a classic conflict; <strong>(2)</strong> the CUDA runtime <em>inside</em> your workload image must be supported by the installed driver (newer CUDA userspace generally needs a recent enough driver). If <code>nvidia-smi</code> works on the host but the driver daemonset is unhealthy, you likely have both fighting.</p>
+
+<h2>4. The device plugin itself — did it register?</h2>
+<p>This is the component that actually publishes <code>nvidia.com/gpu</code>. If steps 1–3 are clean but capacity is still 0, read its logs directly:</p>
+<pre><code>kubectl -n gpu-operator logs -l app=nvidia-device-plugin-daemonset</code></pre>
+<p>Healthy output enumerates the GPUs and reports registration with the kubelet. Common failures you'll see here: it can't find <code>libnvidia-ml.so</code> (driver not visible to the plugin — back to step 3), the kubelet device-plugin socket path is wrong (unusual kubelet config), or the pod can't schedule at all because of a taint. Speaking of which:</p>
+
+<h2>5. Taints and tolerations — the "it registered but nothing schedules" case</h2>
+<p>A subtle variant: capacity <em>does</em> show up, but your workload still sits <code>Pending</code>. Many GPU node pools carry a taint like <code>nvidia.com/gpu=present:NoSchedule</code> so only GPU workloads land there. If your pod doesn't tolerate it, the scheduler skips the node. Check both sides:</p>
+<pre><code>kubectl describe node &lt;node&gt; | grep -i taint
+kubectl describe pod &lt;pod&gt; | grep -iA3 -e toleration -e events</code></pre>
+<p>The Operator's own operands ship with the right tolerations; your application pods need them added explicitly if the pool is tainted.</p>
+
+<h2>6. DCGM — the last mile for visibility</h2>
+<p>Once scheduling works, <strong>DCGM (and dcgm-exporter)</strong> is what gives you per-GPU utilization, ECC/XID errors, and thermal throttling in Prometheus. It's not required for scheduling, but if <code>dcgm-exporter</code> is crash-looping you'll be flying blind on exactly the metric that tells you whether the GPU you fought to detect is now sitting idle. Its logs live in the same namespace and its failures usually trace back to the same driver/toolkit chain above.</p>
+
+<h2>Quick reference: symptom → likely link in the chain</h2>
+<table>
+<tr><th>Symptom</th><th>Look at</th></tr>
+<tr><td><code>nvidia.com/gpu</code> absent, no NFD label</td><td>NFD / node passthrough (step 1)</td></tr>
+<tr><td>Capacity 0, host <code>nvidia-smi</code> fine, no <code>nvidia</code> runtime</td><td>containerd config + RuntimeClass (step 2)</td></tr>
+<tr><td>Device plugin crash-loops, can't find libnvidia-ml</td><td>driver / version skew (steps 3–4)</td></tr>
+<tr><td>Capacity present but pod stays Pending</td><td>taints / tolerations (step 5)</td></tr>
+<tr><td>Scheduling OK, no utilization metrics</td><td>DCGM exporter (step 6)</td></tr>
+</table>
+
+<h2>The meta-lesson</h2>
+<p>Almost every "GPU Operator not detecting GPUs" incident is one broken link in the NFD → driver → toolkit → device-plugin chain, and the fastest path is to walk it top-down reading each component's own logs rather than guessing. The hardware is almost never the problem; the wiring between the host driver and the container runtime almost always is.</p>
+
+<div class="cta">
+Got detection working? The next question is whether those cards are actually being <em>used</em>. See <a href="/reduce-llm-inference-cost-kubernetes.html">how to reduce LLM inference cost on Kubernetes</a> and <a href="/kubernetes-gpu-scheduling-cost.html">why your GPU cluster is 30–50% idle</a> — and run the <a href="/">free idle-cost calculator</a> to put a number on it.
+</div>
+
+<div class="box">
+<strong>Get the next field note.</strong> Practical, occasional notes on GPU/K8s reliability + cost and AI-agent infrastructure — the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'gpu-operator-detection'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your GPUs behave in production.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/reduce-kubernetes-gpu-costs.html">Reduce Kubernetes GPU Costs</a> · <a href="/reduce-llm-inference-cost-kubernetes.html">Reduce LLM Inference Cost</a> · <a href="/kubernetes-gpu-scheduling-cost.html">GPU Scheduling &amp; Idle Cost</a></p>
+<p>Not affiliated with NVIDIA. Component names (GPU Operator, NFD, DCGM, container-toolkit) refer to NVIDIA's open-source projects; behavior varies by version — always confirm against the version you run.</p>
+</footer>
+</article>
+</div>
+<script>(function(){var T='https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/track';function b(t,x){try{fetch(T,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({type:t,page:location.pathname,ref:document.referrer||''},x||{})),keepalive:true})}catch(e){}}b('pageview');document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&a.href&&/gumroad\.com|amazon\.com|\/l\/|calendly|cal\.com|\/Audit/.test(a.href)){b('cta_click',{meta:{href:a.href}})}},true)})();</script>
+</body>
+</html>
