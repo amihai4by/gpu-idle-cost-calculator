@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to safely run untrusted AI-agent code on GCP</title>
+<meta name="description" content="A threat model and defense guide for running untrusted AI-agent-generated code on GCP: blocking the metadata server, gVisor/GKE Sandbox and Cloud Run isolation, per-task ephemeral service accounts, egress controls, seccomp, and hard timeouts.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/sandbox-untrusted-ai-agent-code-gcp.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="How to safely run untrusted AI-agent code on GCP">
+<meta property="og:description" content="The threat model for agent-generated code — credential theft via the metadata server, data exfiltration — and the concrete GCP defenses: sandboxed nodes, ephemeral least-privilege service accounts, egress controls and seccomp.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/sandbox-untrusted-ai-agent-code-gcp.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="How to safely run untrusted AI-agent code on GCP">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "How to safely run untrusted AI-agent code on GCP",
+  "description": "A threat model and defense-in-depth guide for executing untrusted AI-agent-generated code on GCP: metadata-server blocking, gVisor sandboxing, ephemeral least-privilege service accounts, egress controls, seccomp and timeouts.",
+  "author": {"@type": "Person", "name": "Altostratus — AI-infrastructure engineering"},
+  "mainEntityOfPage": "https://gpu-cost.altostratus.biz/sandbox-untrusted-ai-agent-code-gcp.html"
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type":"Question","name":"How do you stop agent code from stealing GCP credentials via the metadata server?","acceptedAnswer":{"@type":"Answer","text":"Enable GKE Workload Identity. Without it, a pod can query the metadata server at 169.254.169.254 and obtain the node's broadly privileged default service-account token. Workload Identity reconfigures the in-cluster metadata server so a pod can only mint tokens for its own least-privilege service account, not the node's. For a task that needs no cloud credentials at all, additionally deny egress to that address."}},
+    {"@type":"Question","name":"Does a container give enough isolation for untrusted code?","acceptedAnswer":{"@type":"Answer","text":"A standard container shares the host kernel, so a kernel exploit escapes it. For genuinely untrusted, agent-generated code use a stronger boundary — gVisor (GKE Sandbox) which interposes a user-space kernel, or Cloud Run, whose instances run in a gVisor-based sandbox — layered with least privilege and egress controls."}},
+    {"@type":"Question","name":"What service account should run untrusted agent code?","acceptedAnswer":{"@type":"Answer","text":"A dedicated, minimal, per-task service account with only the permissions that task needs — never the default Compute Engine service account, which is broadly privileged. Short-lived credentials scoped per task limit what stolen tokens can do."}}
+  ]
+}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}h3{font-size:1.12rem;margin-top:1.6rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+table{width:100%;border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.5rem;border-bottom:1px solid var(--border);font-size:.95rem}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>How to safely run untrusted AI-agent code on GCP</h1>
+<p class="lead">The moment your product lets an LLM agent write and execute code — a code interpreter, a data-analysis tool, an autonomous task runner — you are running <strong>untrusted code on your infrastructure</strong>. The model is not malicious, but its output is attacker-influenceable through prompt injection, and it has no concept of your security boundary. This is a defense-in-depth problem, and on GCP the defaults are dangerously permissive. Here is the threat model and the layered fix.</p>
+
+<div class="box">💡 Running agent workloads on GPUs too? The <a href="/">free GPU Idle-Cost Calculator</a> shows what idle accelerator capacity is costing you — a two-minute number, no signup.</div>
+
+<h2>The threat model</h2>
+<p>Assume the code that runs is adversarial. Concretely, three things go wrong:</p>
+<ul>
+<li><strong>Ambient credential theft.</strong> Every GCP VM and GKE node exposes a <strong>metadata server at <code>169.254.169.254</code></strong> that hands out OAuth access tokens for the attached service account to anything that can make an HTTP request to it — no password, no extra auth. Agent code that curls <code>http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token</code> walks away with your cloud credentials.</li>
+<li><strong>Sandbox escape.</strong> A normal container shares the host kernel. A kernel exploit, or a misconfiguration like <code>privileged: true</code> or a mounted Docker socket, turns "code ran in a container" into "code owns the node."</li>
+<li><strong>Data exfiltration.</strong> Even without escaping, code with open network egress can POST your data — secrets it found, customer records it was handed — to an attacker endpoint. Unrestricted outbound is a leak channel.</li>
+</ul>
+
+<h2>Defense 1 — Close the metadata credential path (do this first)</h2>
+<p>This is the highest-value single control, and the correct mechanism on GKE is <strong>Workload Identity</strong> — not a blanket firewall rule. Here is the important nuance: with Workload Identity enabled, the in-cluster GKE metadata server intercepts requests to <code>169.254.169.254</code> and only ever returns a token for the pod's <em>own</em> bound Google service account. It refuses to hand out the node's powerful default service-account credentials. So enabling Workload Identity is what actually neutralizes the credential-theft path; the metadata address stays reachable precisely because it is now the governed, least-privilege token broker.</p>
+<pre><code># Enable on the cluster, then bind a K8s SA to a minimal Google SA:
+gcloud container clusters update CLUSTER \
+  --workload-pool=PROJECT_ID.svc.id.goog
+
+gcloud iam service-accounts add-iam-policy-binding \
+  agent-task@PROJECT_ID.iam.gserviceaccount.com \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:PROJECT_ID.svc.id.goog[agent-sandbox/agent-ksa]"</code></pre>
+<p>Do <strong>not</strong> simply blanket-block egress to <code>169.254.169.254</code> when you rely on Workload Identity — that same address is how the pod obtains its own least-privilege token, so blocking it breaks legitimate auth. The exception is a task that needs <em>zero</em> Google Cloud credentials: for that workload, additionally deny egress to the metadata IP so it can't reach the server at all.</p>
+<pre><code>apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: deny-metadata, namespace: agent-sandbox}
+spec:
+  # apply ONLY to no-cloud-access tasks, not Workload-Identity pods
+  podSelector: {matchLabels: {needs-gcp-creds: "false"}}
+  policyTypes: [Egress]
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except: [169.254.169.254/32]   # block the metadata server</code></pre>
+<p>On plain Compute Engine there is no Workload Identity broker, so the metadata server always returns the instance's own service-account token on the <code>v1</code> path — note that disabling the legacy <code>v0.1</code>/<code>v1beta1</code> endpoints does <em>not</em> close that <code>v1</code> token path. The hardening there is to attach a <strong>minimal (or no) service account</strong> to the instance so the token that leaks is nearly powerless, and for untrusted code to block egress to <code>169.254.169.254</code> at the firewall or host level so the token endpoint is simply unreachable. The principle is the same: untrusted code must never be able to obtain a token for anything more powerful than its own task identity.</p>
+
+<h2>Defense 2 — A real isolation boundary: gVisor or Cloud Run</h2>
+<p>Because a container shares the host kernel, use a stronger boundary for genuinely untrusted code. Two GCP-native options:</p>
+<ul>
+<li><strong>GKE Sandbox (gVisor).</strong> gVisor interposes a user-space kernel between the workload and the host, intercepting syscalls so a kernel-level exploit hits the sandbox, not the node. Create a sandboxed node pool, then opt a pod in with a runtime class:
+<pre><code>spec:
+  runtimeClassName: gvisor
+  nodeSelector:
+    sandbox.gke.io/runtime: gvisor</code></pre>
+</li>
+<li><strong>Cloud Run.</strong> Each container instance runs in a <strong>gVisor-based sandbox</strong> with no persistent host to escape onto. By default an instance can serve many concurrent requests, so for strict one-task-per-instance isolation set <strong>maximum concurrency to 1</strong> — then a single task has the instance to itself. Give the service a minimal service account, restrict VPC egress, and let it scale to zero between tasks. Good when each agent task is a short, stateless unit of work.</li>
+</ul>
+<p>Whichever you pick, disallow the classic escape hatches: never <code>privileged: true</code>, never mount the Docker/containerd socket, and never mount host paths into the sandbox.</p>
+
+<div class="cta">
+Want the whole pattern as a working blueprint? The <a href="https://probizgen.gumroad.com/l/AgentSandboxGCP">Agent Sandbox on GCP pack</a> ships the sandboxed node pool, the metadata-blocking NetworkPolicy, per-task service-account wiring, egress controls and the hardened PodSpec — the defense-in-depth stack from this article, ready to deploy.<br><br>
+And to size the compute behind it, the <a href="/">free GPU Idle-Cost Calculator →</a>
+</div>
+
+<h2>Defense 3 — Per-task ephemeral service accounts, least privilege</h2>
+<p>The default Compute Engine service account is broadly privileged and attached to nodes automatically — never let untrusted code run as it. Instead, mint a <strong>dedicated service account per task type</strong> with only the IAM roles that task genuinely needs (a single bucket, a single dataset), bound to the pod through Workload Identity. Keep credentials <strong>short-lived and per-task</strong> so a stolen token expires fast and unlocks almost nothing. The test to apply: if this exact code were fully compromised, what could the identity it runs as touch? If the answer is more than the task requires, tighten the IAM binding.</p>
+
+<h2>Defense 4 — Egress controls</h2>
+<p>Workload Identity closes the credential path; egress controls close the exfiltration path. Default-deny outbound and allow only what the task needs. In practice that means a NetworkPolicy that denies egress except to a known allowlist, running the workload in a <strong>private cluster</strong> (no public node IPs) with tightly scoped Cloud NAT or none at all, and, for a strong perimeter around your data services, <strong>VPC Service Controls</strong> so tokens can't be used to pull data out to another project even if they leak. If the task legitimately needs the internet, proxy it through an allowlisting egress gateway rather than opening <code>0.0.0.0/0</code>.</p>
+
+<h2>Defense 5 — Harden the pod: seccomp, no-new-privileges, limits, timeouts</h2>
+<p>Assume everything above can fail and make the container itself hostile terrain. A hardened <code>securityContext</code> plus resource caps and a hard deadline:</p>
+<pre><code>securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false      # no-new-privileges
+  readOnlyRootFilesystem: true
+  capabilities: {drop: ["ALL"]}
+  seccompProfile: {type: RuntimeDefault}
+resources:
+  limits: {cpu: "1", memory: 1Gi}      # cap the blast radius
+# on the Pod spec:
+activeDeadlineSeconds: 300             # kill runaway tasks</code></pre>
+<p><code>allowPrivilegeEscalation: false</code> sets no-new-privileges so a setuid binary can't gain rights; <code>seccompProfile: RuntimeDefault</code> filters dangerous syscalls; dropping all capabilities and a read-only root filesystem remove the easy footholds. Resource limits stop a fork-bomb or crypto-miner from taking the node, and <code>activeDeadlineSeconds</code> guarantees the task can't run forever. Mount scratch space as a size-limited <code>emptyDir</code> so writes go somewhere ephemeral and bounded.</p>
+
+<h2>Putting the layers together</h2>
+<table>
+<tr><th>Layer</th><th>Stops</th><th>Mechanism on GCP</th></tr>
+<tr><td>Metadata path</td><td>Credential theft</td><td>Workload Identity (deny 169.254.169.254 only for no-cred tasks)</td></tr>
+<tr><td>gVisor / Cloud Run</td><td>Kernel escape</td><td>GKE Sandbox runtimeClass / Cloud Run isolation</td></tr>
+<tr><td>Ephemeral least-priv SA</td><td>Lateral movement</td><td>Per-task SA, minimal IAM, short-lived</td></tr>
+<tr><td>Egress controls</td><td>Data exfiltration</td><td>Default-deny NetworkPolicy, private cluster, VPC-SC</td></tr>
+<tr><td>Pod hardening</td><td>Privilege gain, runaways</td><td>seccomp, drop caps, limits, deadline</td></tr>
+</table>
+<p>No single layer is sufficient — the point of defense in depth is that an agent has to defeat all of them, and the first two (Workload Identity closing the credential path and a real gVisor sandbox) already remove the two attacks that turn "the model wrote bad code" into "the attacker owns our project." This is the same governance discipline the wider agentic-AI wave demands: treat model output as untrusted input, and give it the least power that still lets it do its job.</p>
+
+<div class="cta">
+Want a human to review <em>your</em> agent-execution setup — the service-account scopes, the egress, the escape hatches you forgot — book a <a href="https://altostratus.biz/Audit">GPU Cost &amp; Reliability Audit →</a> (we cover agent-infra security and cost together).
+</div>
+
+<div class="box">
+<strong>Get the next field note.</strong> Practical, occasional notes on AI-infra security and cost — the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'agent-sandbox-gcp-guide'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+
+<h2>Related reading</h2>
+<p>Run the compute behind it well: <a href="/production-vllm-kubernetes-guide.html">production vLLM on Kubernetes</a>, <a href="/kubernetes-gpu-scheduling-cost.html">why GPU clusters sit idle</a>, and <a href="/reduce-llm-inference-cost-kubernetes.html">reduce LLM inference cost</a>.</p>
+
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra — including the security boundaries around agentic workloads.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/production-vllm-kubernetes-guide.html">Production vLLM on K8s</a> · <a href="/kubernetes-gpu-scheduling-cost.html">GPU Scheduling &amp; Idle Cost</a> · <a href="/reduce-llm-inference-cost-kubernetes.html">Reduce LLM Inference Cost</a></p>
+<p>Not affiliated with Google. GKE, Cloud Run, gVisor, Workload Identity and VPC Service Controls are Google Cloud features; behavior and availability vary by version and configuration — validate against your own project.</p>
+</footer>
+</article>
+</div>
+<script>(function(){var T='https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/track';function b(t,x){try{fetch(T,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({type:t,page:location.pathname,ref:document.referrer||''},x||{})),keepalive:true})}catch(e){}}b('pageview');document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&a.href&&/gumroad\.com|amazon\.com|\/l\/|calendly|cal\.com|\/Audit/.test(a.href)){b('cta_click',{meta:{href:a.href}})}},true)})();</script>
+</body>
+</html>

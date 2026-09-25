@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Production vLLM on Kubernetes: a deployment guide</title>
+<meta name="description" content="A production deployment guide for vLLM on Kubernetes: the OpenAI-compatible server, integer GPU requests, continuous batching and --max-num-seqs, --gpu-memory-utilization, tensor parallelism, KV-cache, readiness probes, autoscaling on queue depth, and model loading.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/production-vllm-kubernetes-guide.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Production vLLM on Kubernetes: a deployment guide">
+<meta property="og:description" content="The real production concerns for serving LLMs with vLLM on Kubernetes: continuous batching, GPU memory utilization, tensor parallelism, KV-cache, probes, and autoscaling on queue depth.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/production-vllm-kubernetes-guide.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Production vLLM on Kubernetes: a deployment guide">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "Production vLLM on Kubernetes: a deployment guide",
+  "description": "A production deployment guide for vLLM on Kubernetes covering the OpenAI-compatible server, GPU requests, continuous batching, KV-cache, tensor parallelism, probes, autoscaling on queue depth, and model loading.",
+  "author": {"@type": "Person", "name": "Altostratus — AI-infrastructure engineering"},
+  "mainEntityOfPage": "https://gpu-cost.altostratus.biz/production-vllm-kubernetes-guide.html"
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type":"Question","name":"How do you request a GPU for vLLM on Kubernetes?","acceptedAnswer":{"@type":"Answer","text":"Through the nvidia.com/gpu extended resource, which is integer-only and non-overcommittable. You set it under limits; Kubernetes copies the value into requests so request equals limit automatically. A pod cannot ask for a fractional physical GPU this way — fractional sharing needs MIG or time-slicing."}},
+    {"@type":"Question","name":"What does --gpu-memory-utilization control in vLLM?","acceptedAnswer":{"@type":"Answer","text":"It sets the fraction of each GPU's memory vLLM reserves for weights plus the KV-cache (default 0.9). Higher values leave more room for KV-cache and therefore more concurrent sequences, but leave less headroom for spikes and other processes on the card."}},
+    {"@type":"Question","name":"What metric should autoscale a vLLM deployment?","acceptedAnswer":{"@type":"Answer","text":"A request-aware signal from vLLM's own Prometheus metrics — typically vllm:num_requests_waiting (queue depth) or the running/waiting ratio — driven through KEDA or a custom-metrics HPA. CPU and memory utilization are poor proxies for LLM serving load."}}
+  ]
+}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}h3{font-size:1.12rem;margin-top:1.6rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+table{width:100%;border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.5rem;border-bottom:1px solid var(--border);font-size:.95rem}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>Production vLLM on Kubernetes: a deployment guide</h1>
+<p class="lead">Getting vLLM to serve one model on one GPU is a one-liner. Getting it to survive real traffic, restarts, node failures and a finance review is the actual job. This guide walks the production concerns in the order they bite: the OpenAI-compatible server, GPU scheduling, the throughput knobs, the KV-cache, tensor parallelism, probes, autoscaling and model loading.</p>
+
+<div class="box">💡 Before you tune anything, know what idle serving is costing you. The <a href="/">free GPU Idle-Cost Calculator</a> turns fleet size and utilization into an annual waste figure in two minutes, no signup.</div>
+
+<h2>The OpenAI-compatible server</h2>
+<p>vLLM ships an OpenAI-compatible HTTP server, so your existing OpenAI SDK clients point at it with a base URL change and nothing else. Launch it with <code>vllm serve</code> (equivalently <code>python -m vllm.entrypoints.openai.api_server</code>):</p>
+<pre><code>vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --served-model-name llama3-8b \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 8192 \
+  --max-num-seqs 256 \
+  --port 8000</code></pre>
+<p>It exposes <code>/v1/chat/completions</code>, <code>/v1/completions</code> and <code>/v1/models</code>, a <code>/health</code> endpoint that returns 200 when the engine is up, and a Prometheus <code>/metrics</code> endpoint. The <code>--served-model-name</code> flag decouples the public model id your clients send from the on-disk weights path — worth setting so you can swap the underlying checkpoint without breaking callers.</p>
+
+<h2>Requesting the GPU (integer-only, request == limit)</h2>
+<p>GPUs are exposed to Kubernetes as the <code>nvidia.com/gpu</code> extended resource, and extended resources have two hard rules: they are <strong>integer-only</strong> and <strong>non-overcommittable</strong>. You cannot request <code>0.5</code> of a physical card through this resource, and you set it under <code>limits</code> — Kubernetes copies that value into <code>requests</code>, so request always equals limit. Fractional sharing is a separate mechanism (MIG or time-slicing); the plain resource is whole cards.</p>
+<pre><code>resources:
+  limits:
+    nvidia.com/gpu: 1      # request is set equal automatically</code></pre>
+<p>One more thing bites tensor-parallel and multi-GPU pods: vLLM uses shared memory for inter-process/NCCL communication, and the container default <code>/dev/shm</code> is tiny. Mount a memory-backed volume:</p>
+<pre><code>volumes:
+- name: dshm
+  emptyDir: {medium: Memory, sizeLimit: 8Gi}
+# ... in the container:
+volumeMounts:
+- {name: dshm, mountPath: /dev/shm}</code></pre>
+
+<h2>Continuous batching and --max-num-seqs</h2>
+<p>vLLM's headline feature is <strong>continuous (in-flight) batching</strong>: it admits new requests into the running batch as sequences finish, instead of waiting for a static batch to complete, which keeps the GPU saturated across concurrent users. You don't turn it on — it is the scheduler. What you tune is <code>--max-num-seqs</code>, the ceiling on sequences running concurrently, and <code>--max-num-batched-tokens</code>, the token budget per scheduler step. Raise <code>--max-num-seqs</code> for more concurrency and throughput; lower it if you're seeing KV-cache preemption (vLLM logging that it is recomputing or swapping sequences because the cache filled). These two flags, plus memory utilization below, are the throughput levers that matter most.</p>
+
+<h2>KV-cache and --gpu-memory-utilization</h2>
+<p>After weights load, vLLM allocates the remaining GPU memory to the <strong>KV-cache</strong> — the per-token attention state that actually determines how many sequences fit at once. <code>--gpu-memory-utilization</code> (default <code>0.90</code>) is the fraction of each card vLLM is allowed to claim. Push it toward 0.95 and you get more KV-cache blocks and higher concurrency; push too far and you leave no headroom for fragmentation spikes and risk CUDA OOM at load. <code>--max-model-len</code> caps context length, which directly caps worst-case KV-cache per request — set it to what you actually serve, not the model's theoretical maximum, or a handful of huge-context requests will starve everyone else. If your workload shares a long system prompt across requests, <code>--enable-prefix-caching</code> reuses that prefix's KV blocks instead of recomputing them.</p>
+
+<h2>Tensor parallelism across GPUs</h2>
+<p>When a model doesn't fit on one card, shard it with <code>--tensor-parallel-size N</code> (across GPUs in one node) and, for very large models across nodes, <code>--pipeline-parallel-size</code>. Match the pod's GPU limit to the tensor-parallel degree — <code>--tensor-parallel-size 4</code> needs <code>nvidia.com/gpu: 4</code> — and keep those GPUs on the same node with fast interconnect (NVLink/NVSwitch where available), because tensor parallelism is communication-heavy and splitting across a slow link tanks throughput. Don't reach for parallelism as a default: a model that fits on one GPU serves cheaper on one GPU than sharded across four, because you pay the communication overhead for nothing.</p>
+
+<div class="cta">
+Serving in production and want the battle-tested manifests? The <a href="https://probizgen.gumroad.com/l/ProductionvLLMonKubernetes">Production vLLM on Kubernetes pack</a> ships the Deployment, probes, PVC model-cache, HPA/KEDA scaler and the tuning defaults from this guide — drop-in and validated.<br><br>
+And to size the fleet first, the <a href="/">free GPU Idle-Cost Calculator →</a>
+</div>
+
+<h2>Readiness and liveness probes</h2>
+<p>The single most common vLLM-on-K8s outage is traffic arriving before the model finishes loading. Loading tens of GB of weights takes real time, so your probes must tolerate it. Point readiness at <code>/health</code> and give liveness a generous startup grace (or use a <code>startupProbe</code>) so the kubelet doesn't kill the pod mid-load:</p>
+<pre><code>startupProbe:
+  httpGet: {path: /health, port: 8000}
+  failureThreshold: 60
+  periodSeconds: 10          # allow up to ~10 min to load
+readinessProbe:
+  httpGet: {path: /health, port: 8000}
+  periodSeconds: 10
+livenessProbe:
+  httpGet: {path: /health, port: 8000}
+  periodSeconds: 20
+  failureThreshold: 3</code></pre>
+<p>Readiness gates the Service endpoint, so a still-loading replica never receives requests; the startup probe protects the slow first minutes; liveness restarts a genuinely wedged engine.</p>
+
+<h2>Autoscaling on queue depth, not CPU</h2>
+<p>CPU and memory are near-useless signals for LLM serving — a GPU-bound pod can be maxed out at low CPU. Scale on vLLM's own Prometheus metrics instead: <code>vllm:num_requests_waiting</code> (queue depth) and <code>vllm:num_requests_running</code>, with <code>vllm:gpu_cache_usage_perc</code> as a saturation indicator. KEDA's Prometheus scaler is the clean path — scale up when average waiting requests per replica crosses a threshold. Two caveats keep it safe: cold starts are slow, so keep a warm floor of replicas and scale <em>up</em> fast, <em>down</em> gently; and scale-to-zero is only viable for genuinely intermittent models where an accepted first-request delay is fine. This is the same request-aware pattern covered in <a href="/reduce-llm-inference-cost-kubernetes.html">reducing LLM inference cost</a>.</p>
+
+<h2>Model loading: PVC vs object store</h2>
+<p>Where the weights come from decides your startup time and your blast radius. Three common patterns:</p>
+<ul>
+<li><strong>Pull at startup</strong> from Hugging Face or an object store (S3/GCS) into an <code>emptyDir</code>. Simplest, but every pod re-downloads, and a rate limit or outage upstream stalls every cold start.</li>
+<li><strong>Shared read-only PVC</strong> (a ReadOnlyMany volume) holding the weights, pre-populated once. Fast, repeatable cold starts and no external dependency at scale-out — usually the right default for a fleet.</li>
+<li><strong>Node-local cache / image bake.</strong> Weights on fast local NVMe or baked into the image trade image size and node prep for the fastest possible load.</li>
+</ul>
+<p>Whichever you pick, mount the cache read-only and set <code>HF_HOME</code>/the model path explicitly so vLLM reads from it rather than re-fetching.</p>
+
+<h2>Multi-model routing</h2>
+<p>A vLLM server hosts one model. To serve several, run one Deployment per model — each independently sized, scaled and probed — and put a router in front that reads the OpenAI <code>model</code> field and forwards to the right backend Service (LiteLLM, an API gateway, or the vLLM production-stack router all do this). This keeps a heavy model's traffic from starving a light one, lets you scale and roll each independently, and isolates a bad deploy to a single model. Consolidate genuinely low-traffic models onto shared GPUs via MIG or time-slicing rather than giving each its own idle card — see <a href="/gpu-time-slicing-vs-mig-kubernetes.html">time-slicing vs MIG</a>.</p>
+
+<h2>The short version</h2>
+<table>
+<tr><th>Concern</th><th>The lever</th><th>Watch out for</th></tr>
+<tr><td>GPU request</td><td><code>nvidia.com/gpu</code> integer, in limits</td><td>No fractional cards; request==limit</td></tr>
+<tr><td>Throughput</td><td>Continuous batching + <code>--max-num-seqs</code></td><td>KV-cache preemption if too high</td></tr>
+<tr><td>Concurrency</td><td><code>--gpu-memory-utilization</code>, <code>--max-model-len</code></td><td>OOM if utilization too aggressive</td></tr>
+<tr><td>Big models</td><td><code>--tensor-parallel-size</code></td><td>Match GPU limit; keep on one node</td></tr>
+<tr><td>Startup</td><td>startupProbe on <code>/health</code></td><td>Liveness killing slow loads</td></tr>
+<tr><td>Scaling</td><td>KEDA on <code>vllm:num_requests_waiting</code></td><td>Cold starts; keep a warm floor</td></tr>
+</table>
+<p>Get these right and vLLM is a genuinely boring, high-utilization serving layer. Get the probes and autoscaling wrong and you get 3 a.m. pages and a GPU bill for capacity you never used.</p>
+
+<div class="cta">
+When you want a human to pressure-test <em>your</em> vLLM setup — the probes, the memory headroom, the scaler that never fires — book a <a href="https://altostratus.biz/Audit">GPU Cost &amp; Reliability Audit →</a>
+</div>
+
+<div class="box">
+<strong>Get the next field note.</strong> Practical, occasional notes on GPU/K8s serving and cost — the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'production-vllm-k8s'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+
+<h2>Related reading</h2>
+<p>Serve efficiently, then watch it: <a href="/reduce-llm-inference-cost-kubernetes.html">reduce LLM inference cost</a>, set up <a href="/dcgm-prometheus-grafana-gpu-monitoring.html">DCGM + Prometheus + Grafana monitoring</a>, <a href="/right-size-gpu-requests-kubernetes.html">right-size GPU requests</a>, and choose <a href="/gpu-time-slicing-vs-mig-kubernetes.html">time-slicing vs MIG</a>.</p>
+
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your GPUs and your inference bill behave in production.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/reduce-llm-inference-cost-kubernetes.html">Reduce LLM Inference Cost</a> · <a href="/dcgm-prometheus-grafana-gpu-monitoring.html">GPU Monitoring with DCGM</a> · <a href="/gpu-time-slicing-vs-mig-kubernetes.html">Time-slicing vs MIG</a></p>
+<p>vLLM is an open-source project; flags, metric names and defaults vary by version — validate against the version you deploy.</p>
+</footer>
+</article>
+</div>
+<script>(function(){var T='https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/track';function b(t,x){try{fetch(T,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({type:t,page:location.pathname,ref:document.referrer||''},x||{})),keepalive:true})}catch(e){}}b('pageview');document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&a.href&&/gumroad\.com|amazon\.com|\/l\/|calendly|cal\.com|\/Audit/.test(a.href)){b('cta_click',{meta:{href:a.href}})}},true)})();</script>
+</body>
+</html>

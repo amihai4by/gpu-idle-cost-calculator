@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Running GPU workloads on spot instances in Kubernetes without losing work</title>
+<meta name="description" content="How to run GPU workloads on spot/preemptible instances in Kubernetes without losing work: the preemption notice, graceful node shutdown handlers, checkpointing training, PodDisruptionBudgets, spreading across capacity, and mixing spot with on-demand.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/gpu-spot-instances-kubernetes-interruptions.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Running GPU workloads on spot instances in Kubernetes without losing work">
+<meta property="og:description" content="Spot GPUs are a large discount if you handle interruptions right: the ~30s preemption notice, graceful node shutdown, checkpointing, PDBs, capacity spreading, and mixing spot with on-demand.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/gpu-spot-instances-kubernetes-interruptions.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="GPU workloads on spot instances in Kubernetes">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "Running GPU workloads on spot instances in Kubernetes without losing work",
+  "description": "A practical guide to running GPU workloads on spot/preemptible Kubernetes nodes without losing work: the preemption notice, graceful node shutdown, checkpointing training, PodDisruptionBudgets, capacity spreading, and mixing spot with on-demand.",
+  "author": {"@type": "Person", "name": "Altostratus — AI-infrastructure engineering"},
+  "mainEntityOfPage": "https://gpu-cost.altostratus.biz/gpu-spot-instances-kubernetes-interruptions.html"
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type":"Question","name":"How much warning do you get before a spot GPU is reclaimed?","acceptedAnswer":{"@type":"Answer","text":"On Google Cloud, a preemption notice arrives roughly 30 seconds before the node is stopped. On AWS, a Spot interruption notice gives about two minutes. Either way it is short, so your shutdown handling has to be fast and your work must already be checkpointed."}},
+    {"@type":"Question","name":"Does a PodDisruptionBudget protect against spot preemption?","acceptedAnswer":{"@type":"Answer","text":"Only partially. A PDB governs voluntary disruptions like drains and upgrades. A cloud reclaiming a spot node is an involuntary disruption, which a PDB does not block — it only helps during the graceful drain if the platform drains before terminating. Design for the node vanishing regardless."}},
+    {"@type":"Question","name":"Why is spot better for inference than for long training runs?","acceptedAnswer":{"@type":"Answer","text":"Stateless inference replicas can lose a node and keep serving from the others while a replacement scales up, so preemption is a capacity blip. A single long training job holds state, so an interruption without checkpointing loses hours of progress — you must checkpoint frequently to object storage to make spot safe for it."}}
+  ]
+}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}h3{font-size:1.12rem;margin-top:1.6rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+table{width:100%;border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.5rem;border-bottom:1px solid var(--border);font-size:.95rem}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>Running GPU workloads on spot instances in Kubernetes without losing work</h1>
+<p class="lead">Spot and preemptible GPU nodes are the largest single discount available on accelerator compute — typically a very large percentage off on-demand, though the exact figure varies by cloud, region and GPU type. The catch is in the name: the cloud can reclaim the node with almost no notice. Handle interruptions properly and spot is close to free money; handle them badly and you lose a night of training. Here is how to run GPU work on spot in Kubernetes without losing work.</p>
+
+<div class="box">💡 Deciding whether spot is worth it starts with knowing your idle spend on-demand. The <a href="/">free GPU Idle-Cost Calculator</a> gives you that number in two minutes, no signup.</div>
+
+<h2>The economics, honestly</h2>
+<p>Spot capacity is the cloud's spare inventory sold at a steep, variable discount in exchange for the right to take it back. The discount is real and large, but it is not guaranteed capacity: during a regional crunch your preferred GPU type may be unavailable at spot prices, and running nodes can be reclaimed. So the mental model isn't "cheaper on-demand" — it's "interruptible capacity you must architect around." Everything below is about making the interruption a non-event.</p>
+
+<h2>The preemption notice — and why it's short</h2>
+<p>When the cloud reclaims a spot node it sends a preemption/interruption notice first, but the window is small. On <strong>Google Cloud</strong> you get roughly <strong>30 seconds</strong> before the instance is stopped; on <strong>AWS</strong> a Spot interruption notice gives about <strong>two minutes</strong>. That's your entire budget to react — stop accepting new work, flush state, and exit cleanly. Two design consequences follow immediately: your shutdown path must be fast enough to finish inside that window, and your work must already be checkpointed, because you cannot save an hour of progress in 30 seconds.</p>
+
+<h2>React to the notice: graceful node shutdown + SIGTERM handling</h2>
+<p>Kubernetes has a built-in kubelet feature, <strong>Graceful Node Shutdown</strong>, that detects the node going down and terminates pods in order, honoring a shutdown grace period (managed distributions such as GKE enable it on their nodes). On clouds where you manage it yourself, a node-termination handler (for example the AWS Node Termination Handler) watches the instance metadata for the interruption notice and cordons + drains the node. Either way, your pod has to actually respond to <code>SIGTERM</code>:</p>
+<pre><code>spec:
+  terminationGracePeriodSeconds: 25   # must fit INSIDE the ~30s notice
+  containers:
+  - name: trainer
+    lifecycle:
+      preStop:
+        exec: {command: ["/bin/sh","-c","/app/flush-checkpoint.sh"]}</code></pre>
+<p>Keep <code>terminationGracePeriodSeconds</code> comfortably under the cloud's notice window, and have the process trap <code>SIGTERM</code> to write a final checkpoint and close cleanly. A container that ignores <code>SIGTERM</code> and waits for <code>SIGKILL</code> loses whatever was in flight.</p>
+
+<h2>Checkpoint training frequently (the real safety net)</h2>
+<p>For training, the notice window is far too short to save a large model, so the actual protection is <strong>frequent checkpointing to durable storage</strong> during the run — not at shutdown. Write checkpoints on an interval (every N steps or minutes) to object storage (GCS/S3) or a persistent volume, keep the last few, and make startup <em>resume from the latest checkpoint</em> rather than restart. Then a preemption costs you at most the work since the last checkpoint. The shutdown handler's job shrinks to "best-effort flush the most recent state," and correctness no longer depends on catching the notice at all.</p>
+
+<div class="cta">
+Want your spot GPU strategy pressure-tested — checkpoint cadence, drain handling, the on-demand floor that keeps you serving? Book a <a href="https://altostratus.biz/Audit">GPU Cost &amp; Reliability Audit →</a> — we find the waste and the fragility on your actual cluster.<br><br>
+Or start with the number: the <a href="/">free GPU Idle-Cost Calculator →</a>
+</div>
+
+<h2>PodDisruptionBudgets — useful, but know the limit</h2>
+<p>A <strong>PodDisruptionBudget</strong> keeps a minimum number of replicas available during <em>voluntary</em> disruptions — node drains, cluster upgrades, autoscaler scale-down:</p>
+<pre><code>apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: infer-pdb}
+spec:
+  minAvailable: 2
+  selector: {matchLabels: {app: llm-inference}}</code></pre>
+<p>The critical caveat: a cloud yanking a spot node is an <strong>involuntary</strong> disruption, which a PDB does not prevent. It helps when the platform <em>drains</em> the node before terminating (the graceful path), and it protects you from the autoscaler evicting too many replicas at once — but you must still design for a node simply vanishing. PDBs reduce correlated loss; they don't abolish it.</p>
+
+<h2>Spread across capacity so one pool can't take you down</h2>
+<p>Concentration is the enemy: if every replica sits in one zone on one instance type, a single capacity event reclaims them together. Spread the risk with <strong>topology spread constraints</strong> across zones and by diversifying instance types in the node pool so the scheduler can place work wherever spot capacity exists:</p>
+<pre><code>topologySpreadConstraints:
+- maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: ScheduleAnyway
+  labelSelector: {matchLabels: {app: llm-inference}}</code></pre>
+<p>The more zones and GPU SKUs your workload can accept, the less likely a single reclaim wave takes down a meaningful fraction of your fleet at once.</p>
+
+<h2>Mix spot and on-demand with node affinity</h2>
+<p>The robust production pattern is a <strong>hybrid</strong>: a small on-demand baseline that guarantees service, plus spot for the elastic bulk. Managed spot nodes carry a label (on GKE, <code>cloud.google.com/gke-spot: "true"</code>) you can select on, and it's common to taint spot nodes so only workloads that tolerate interruption land there. Route the on-demand floor with node affinity and let burst/interruptible replicas prefer spot:</p>
+<pre><code>affinity:
+  nodeAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 80
+      preference:
+        matchExpressions:
+        - {key: cloud.google.com/gke-spot, operator: In, values: ["true"]}
+tolerations:
+- {key: cloud.google.com/gke-spot, operator: Equal, value: "true", effect: NoSchedule}</code></pre>
+<p>Now normal traffic is served by the on-demand base even if every spot node disappears, while the cost savings ride on the spot majority.</p>
+
+<h2>Inference vs training: they need different things</h2>
+<p>The two workloads fail differently, so treat them differently:</p>
+<table>
+<tr><th></th><th>Inference (stateless)</th><th>Training (stateful)</th></tr>
+<tr><td>What a preemption costs</td><td>A capacity blip; other replicas serve</td><td>Progress since the last checkpoint</td></tr>
+<tr><td>Primary defense</td><td>Replicas + PDB + fast scale-up; on-demand floor</td><td>Frequent checkpointing + resume</td></tr>
+<tr><td>Spot suitability</td><td>High — designed for it</td><td>Good <em>if</em> checkpointing is solid</td></tr>
+</table>
+<p>Stateless inference is the easy win: keep enough replicas across zones with an on-demand floor and a preemption is invisible to users. Long training runs are safe on spot only when checkpoint-and-resume is genuinely reliable — test it by killing a node mid-run and confirming the job picks up from the last checkpoint, not from step zero.</p>
+
+<h2>The checklist</h2>
+<p>Spot GPUs pay off when all of this is true: the process traps <code>SIGTERM</code> and exits inside the notice window; <code>terminationGracePeriodSeconds</code> fits the ~30s (GCP) / ~2-min (AWS) budget; training checkpoints frequently to durable storage and resumes; replicas spread across zones and instance types; a PDB limits voluntary correlated loss; and an on-demand floor guarantees baseline service. Miss the checkpointing or the on-demand floor and the discount isn't worth the 3 a.m. surprise. Get them right and you're serving the same work at a fraction of the bill — the highest-leverage GPU cost move after fixing plain idle capacity, which the <a href="/kubernetes-gpu-scheduling-cost.html">scheduling &amp; idle-cost guide</a> covers.</p>
+
+<div class="cta">
+See what your fleet wastes today, on-demand: the <a href="/">free GPU Idle-Cost Calculator</a> turns size and utilization into an annual figure — the baseline you compare a spot strategy against. When you want it done on your real cluster, book the <a href="https://altostratus.biz/Audit">GPU Cost &amp; Reliability Audit →</a>
+</div>
+
+<div class="box">
+<strong>Get the next field note.</strong> Practical, occasional notes on GPU/K8s cost and reliability — the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'gpu-spot-interruptions'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+
+<h2>Related reading</h2>
+<p>Cut GPU spend from every angle: <a href="/kubernetes-gpu-scheduling-cost.html">why GPU clusters sit idle</a>, <a href="/right-size-gpu-requests-kubernetes.html">right-size GPU requests</a>, <a href="/reduce-llm-inference-cost-kubernetes.html">reduce LLM inference cost</a>, and deploy serving with <a href="/production-vllm-kubernetes-guide.html">production vLLM on Kubernetes</a>.</p>
+
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your GPUs and your bill behave in production.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/kubernetes-gpu-scheduling-cost.html">GPU Scheduling &amp; Idle Cost</a> · <a href="/right-size-gpu-requests-kubernetes.html">Right-size GPU Requests</a> · <a href="/reduce-llm-inference-cost-kubernetes.html">Reduce LLM Inference Cost</a></p>
+<p>Spot/preemptible behavior, notice windows and labels vary by cloud provider and change over time — validate against your provider's current documentation and your own cluster.</p>
+</footer>
+</article>
+</div>
+<script>(function(){var T='https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/track';function b(t,x){try{fetch(T,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({type:t,page:location.pathname,ref:document.referrer||''},x||{})),keepalive:true})}catch(e){}}b('pageview');document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&a.href&&/gumroad\.com|amazon\.com|\/l\/|calendly|cal\.com|\/Audit/.test(a.href)){b('cta_click',{meta:{href:a.href}})}},true)})();</script>
+</body>
+</html>
