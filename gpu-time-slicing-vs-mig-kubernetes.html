@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Time-Slicing vs MIG on Kubernetes: When to Use Which</title>
+<meta name="description" content="GPU time-slicing vs MIG on Kubernetes: time-slicing shares SM time with no isolation; MIG hardware-partitions memory and compute into isolated, fixed profiles. When to use which.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/gpu-time-slicing-vs-mig-kubernetes.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="GPU Time-Slicing vs MIG on Kubernetes: When to Use Which">
+<meta property="og:description" content="Time-slicing shares SM time with no isolation; MIG hardware-partitions into fixed, isolated profiles. When to use which.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/gpu-time-slicing-vs-mig-kubernetes.html">
+<meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"Article","headline":"GPU Time-Slicing vs MIG on Kubernetes: When to Use Which","author":{"@type":"Person","name":"Altostratus — AI-infrastructure engineering"},"mainEntityOfPage":"https://gpu-cost.altostratus.biz/gpu-time-slicing-vs-mig-kubernetes.html"}
+</script>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is the difference between GPU time-slicing and MIG?","acceptedAnswer":{"@type":"Answer","text":"Time-slicing shares one GPU by having pods take turns on the SMs with no memory or fault isolation; MIG hardware-partitions a supported GPU into instances with dedicated memory and compute, so each is isolated."}},{"@type":"Question","name":"Does GPU time-slicing provide memory isolation?","acceptedAnswer":{"@type":"Answer","text":"No — no memory or fault isolation. All pods share the framebuffer, so one pod's OOM causes OOM for neighbors and a fatal Xid can reset the shared card for every tenant."}}]}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}h3{font-size:1.12rem;margin-top:1.6rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>GPU Time-Slicing vs MIG on Kubernetes: When to Use Which</h1>
+<p class="lead">Both let several pods share one physical GPU through the NVIDIA GPU Operator, so they get lumped together — but they are not interchangeable. The difference is <strong>isolation</strong>, and choosing wrong shows up as wasted money or a production incident.</p>
+<div class="box">💡 Is sharing worth it? The <a href="/">free GPU Idle-Cost Calculator</a> turns fleet size and utilization into an annual figure.</div>
+
+<h2>Why share a GPU at all</h2>
+<p>Kubernetes hands out whole GPUs: <code>nvidia.com/gpu</code> is integer-only and the request must equal the limit, so a pod needing 10% of a card still reserves it all — and it <a href="/kubernetes-gpu-scheduling-cost.html">bills at 100% whether it runs at 100% or 0%</a>. Both mechanisms advertise one GPU as several schedulable units so low-utilization workloads stop hogging whole cards — same goal, different guarantees.</p>
+
+<h2>Time-slicing: shared SM time, no isolation</h2>
+<p>Time-slicing advertises a physical GPU as N replicas; pods scheduled onto them <strong>take turns on the streaming multiprocessors (SMs)</strong>. It is pure oversubscription, and the critical property is what it does <em>not</em> provide: <strong>no memory isolation</strong> (every pod sees the full framebuffer, so one pod's over-allocation causes OOM errors for its neighbors) and <strong>no fault isolation</strong> (a fatal Xid from one tenant can reset the GPU and take every pod on that card down). You get maximum density on almost any GPU, via config:</p>
+<pre><code>sharing:
+  timeSlicing:
+    resources:
+      - name: nvidia.com/gpu
+        replicas: 4        # 4 units per GPU</code></pre>
+<p>It suits <strong>dev, CI and light inference</strong> — not isolated production tenants.</p>
+
+<h2>MIG: hardware-partitioned, isolated instances</h2>
+<p>Multi-Instance GPU (MIG) is a hardware feature on <strong>select data-center GPUs</strong> — the A100, A30, H100 and H200 among them (many cards, e.g. the A40, L4 and L40S, have no MIG). It physically carves a card into <strong>GPU instances</strong>, each with dedicated memory and compute — a smaller standalone GPU with <strong>real memory and fault isolation</strong>, so one instance erroring does not touch the others. The tradeoff is rigidity: profiles are a <strong>fixed set</strong>, <code>&lt;compute&gt;g.&lt;memory&gt;gb</code>. An A100 has seven compute slices, so geometries are constrained — an A100-80GB offers <code>1g.10gb</code> (up to 7), <code>3g.40gb</code>, or the full <code>7g.80gb</code>. List supported profiles with <code>nvidia-smi mig -lgip</code>; reconfiguring requires draining the GPU. The GPU Operator exposes instances as resources like <code>nvidia.com/mig-1g.10gb</code>.</p>
+
+<h2>The decision: reason from the blast radius</h2>
+<p><strong>Use time-slicing</strong> for trusted, bursty, low-utilization work where a shared failure is a shrug — dev, CI, notebooks, light inference — most packing, least effort. <strong>Use MIG</strong> when tenants must not affect each other — multiple teams on one card, latency-sensitive serving with an SLO, untrusted workloads — and your GPUs support it. The two also combine — MIG for isolated production, time-slicing for the dev pool — and for a job that saturates a whole GPU, use neither. Whichever you pick, measure utilization from <a href="/dcgm-prometheus-grafana-gpu-monitoring.html">DCGM</a> first so you share the underused cards.</p>
+
+<div class="cta">
+Want the working time-slicing and MIG config, the node-pool separation, and the utilization dashboards to prove the recovered spend? That is the <a href="https://probizgen.gumroad.com/l/GPUCost-OptimizationPack">GPU Cost-Optimization Pack</a> — drop-in and validated.<br><br>
+Start with the number: the <a href="/">free GPU Idle-Cost Calculator →</a>
+</div>
+
+<div class="box">
+<strong>Get the next field note.</strong> Practical, occasional notes on GPU/K8s sharing and cost — the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'time-slicing-vs-mig'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+
+<h2>Related reading</h2>
+<p>Measure first with <a href="/dcgm-prometheus-grafana-gpu-monitoring.html">DCGM, Prometheus &amp; Grafana</a>, then <a href="/right-size-gpu-requests-kubernetes.html">right-size GPU requests</a>, understand <a href="/kubernetes-gpu-scheduling-cost.html">why clusters sit 30–50% idle</a>, and <a href="/reduce-llm-inference-cost-kubernetes.html">reduce LLM inference cost</a>.</p>
+
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your GPUs behave in production.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/kubernetes-gpu-scheduling-cost.html">GPU Scheduling &amp; Idle Cost</a> · <a href="/right-size-gpu-requests-kubernetes.html">Right-size GPU Requests</a> · <a href="/dcgm-prometheus-grafana-gpu-monitoring.html">GPU Monitoring with DCGM</a> · <a href="/reduce-llm-inference-cost-kubernetes.html">Reduce LLM Inference Cost</a></p>
+<p>Not affiliated with NVIDIA. Time-slicing and MIG require the NVIDIA GPU Operator; MIG support and supported profiles vary by GPU and version — validate against what you run.</p>
+</footer>
+</article>
+</div>
+<script>(function(){var T='https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/track';function b(t,x){try{fetch(T,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({type:t,page:location.pathname,ref:document.referrer||''},x||{})),keepalive:true})}catch(e){}}b('pageview');document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&a.href&&/gumroad\.com|amazon\.com|\/l\/|calendly|cal\.com|\/Audit/.test(a.href)){b('cta_click',{meta:{href:a.href}})}},true)})();</script>
+</body>
+</html>

@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Monitoring on Kubernetes with DCGM, Prometheus &amp; Grafana</title>
+<meta name="description" content="GPU monitoring on Kubernetes with dcgm-exporter, Prometheus and Grafana: the DCGM_FI_* metrics that matter, the ServiceMonitor scrape, and the alerts most setups miss.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/dcgm-prometheus-grafana-gpu-monitoring.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="GPU Monitoring on Kubernetes with DCGM, Prometheus & Grafana">
+<meta property="og:description" content="The DCGM_FI_* metrics that matter, the ServiceMonitor scrape, and the alerts most setups miss.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/dcgm-prometheus-grafana-gpu-monitoring.html">
+<meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"Article","headline":"GPU Monitoring on Kubernetes with DCGM, Prometheus & Grafana","author":{"@type":"Person","name":"Altostratus — AI-infrastructure engineering"},"mainEntityOfPage":"https://gpu-cost.altostratus.biz/dcgm-prometheus-grafana-gpu-monitoring.html"}
+</script>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Which DCGM metric shows real GPU utilization?","acceptedAnswer":{"@type":"Answer","text":"DCGM_FI_DEV_GPU_UTIL is coarse; use DCGM_FI_PROF_SM_ACTIVE and DCGM_FI_PROF_PIPE_TENSOR_ACTIVE."}},{"@type":"Question","name":"What GPU alerts do most setups miss?","acceptedAnswer":{"@type":"Answer","text":"Throttling (DCGM_FI_DEV_CLOCK_THROTTLE_REASONS), double-bit ECC and XID errors, and allocated-but-idle GPUs."}}]}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}h3{font-size:1.12rem;margin-top:1.6rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>GPU Monitoring on Kubernetes with DCGM, Prometheus &amp; Grafana</h1>
+<p class="lead">The vendor-supported way to know whether a GPU is busy and healthy on Kubernetes is <strong>dcgm-exporter → Prometheus → Grafana</strong>: dcgm-exporter runs as a DaemonSet reading per-GPU telemetry from the driver, publishing it on <code>:9400/metrics</code> for Prometheus to scrape and Grafana to graph. Install it via the NVIDIA GPU Operator or the standalone Helm chart. The skill is knowing which <code>DCGM_FI_*</code> series matter.</p>
+<div class="box">💡 The <a href="/">free GPU Idle-Cost Calculator</a> turns fleet size and utilization into an annual waste figure in two minutes — the number these dashboards help you attack.</div>
+
+<h2>Utilization: the metric that lies</h2>
+<p><code>DCGM_FI_DEV_GPU_UTIL</code> is what <code>nvidia-smi</code> shows and what everyone graphs first — and it misleads. It reports the fraction of time <em>at least one</em> kernel was resident, so sparse tiny kernels pin it at 100% while the compute engines idle. For the truth add the profiling ("DCP") series: <code>DCGM_FI_PROF_SM_ACTIVE</code> (how much of the SM array works), <code>DCGM_FI_PROF_PIPE_TENSOR_ACTIVE</code> (Tensor-Core activity) and <code>DCGM_FI_PROF_DRAM_ACTIVE</code> (memory-bandwidth pressure). Graph <code>GPU_UTIL</code> beside <code>PROF_SM_ACTIVE</code> and you'll routinely see "100% utilized" at 20% SM-active.</p>
+
+<h2>Memory, throttling, and health</h2>
+<p>Memory usually caps concurrency before compute: <code>DCGM_FI_DEV_FB_USED</code> / <code>DCGM_FI_DEV_FB_FREE</code> (framebuffer, MiB) drive a "used / total" panel. Throttling is the panel most skip — a card at a thermal/power limit silently downclocks, no error. <code>DCGM_FI_DEV_CLOCK_THROTTLE_REASONS</code> is a bitmask; the trouble bits include HW slowdown (<code>0x8</code>), HW thermal (<code>0x40</code>), HW power-brake (<code>0x80</code>) and SW power cap (<code>0x4</code>) — read it alongside <code>DCGM_FI_DEV_GPU_TEMP</code>. For health, <code>DCGM_FI_DEV_ECC_DBE_VOL_TOTAL</code> counts uncorrectable double-bit ECC errors that corrupt compute, and <code>DCGM_FI_DEV_XID_ERRORS</code> reports the last XID the driver raised — up to fatal ones like Xid 79.</p>
+
+<h2>Wiring the scrape: the ServiceMonitor</h2>
+<p>With the Prometheus Operator, point Prometheus at the exporter's Service:</p>
+<pre><code>apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata: {name: dcgm-exporter, namespace: gpu-operator,
+  labels: {release: kube-prometheus-stack}}  # must match serviceMonitorSelector
+spec:
+  selector: {matchLabels: {app: nvidia-dcgm-exporter}}
+  endpoints: [{port: gpu-metrics, interval: 15s, path: /metrics}]</code></pre>
+<p>The usual "exporter is up but Prometheus is empty" bug is a label mismatch — Prometheus only adopts ServiceMonitors matching its <code>serviceMonitorSelector</code>, so verify that <code>release:</code> label matches.</p>
+
+<h2>The alerts most setups miss</h2>
+<p>Utilization and memory panels are table stakes; these alerts earn their keep. <strong>Throttling:</strong> a thermal/power bit in <code>CLOCK_THROTTLE_REASONS</code> for minutes. <strong>Hardware faults:</strong> any rise in <code>ECC_DBE_VOL_TOTAL</code> or a new <code>XID_ERRORS</code> — cordon and drain before it kills a job. <strong>Allocated-but-idle:</strong> a pod-bound GPU at near-zero <code>PROF_SM_ACTIVE</code> for hours, the biggest pure-waste signal. <strong>Memory saturation:</strong> <code>FB_USED/(FB_USED+FB_FREE)</code> over ~95%. Start from NVIDIA's official dcgm-exporter Grafana dashboard and layer these failure and waste alerts on top — that is how you catch both dying cards and idle spend.</p>
+
+<div class="cta">
+Skip the hand-rolling: the <a href="https://probizgen.gumroad.com/l/GPUMonitoringStarterPack">GPU Monitoring Starter Pack</a> ships the dcgm-exporter + Prometheus + Grafana config, the panels above, and the throttle/ECC/XID/idle alert rules — drop-in and validated.<br><br>
+And put a number on the idle you'll surface: the <a href="/">free GPU Idle-Cost Calculator →</a>
+</div>
+
+<div class="box">
+<strong>Get the next field note.</strong> Practical, occasional notes on GPU/K8s monitoring and cost — the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'dcgm-monitoring'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+
+<h2>Related reading</h2>
+<p>Once you can see real utilization, act on it: <a href="/right-size-gpu-requests-kubernetes.html">right-size GPU requests</a>, choose <a href="/gpu-time-slicing-vs-mig-kubernetes.html">time-slicing vs MIG</a>, understand <a href="/kubernetes-gpu-scheduling-cost.html">why clusters sit 30–50% idle</a>, and <a href="/reduce-llm-inference-cost-kubernetes.html">reduce LLM inference cost</a>.</p>
+
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your GPUs behave — and get seen — in production.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/kubernetes-gpu-scheduling-cost.html">GPU Scheduling &amp; Idle Cost</a> · <a href="/right-size-gpu-requests-kubernetes.html">Right-size GPU Requests</a> · <a href="/gpu-time-slicing-vs-mig-kubernetes.html">Time-slicing vs MIG</a> · <a href="/reduce-llm-inference-cost-kubernetes.html">Reduce LLM Inference Cost</a></p>
+<p>Not affiliated with NVIDIA. DCGM, dcgm-exporter and the GPU Operator are NVIDIA projects; metric availability and behavior vary by driver, DCGM version and GPU architecture — validate against what you run.</p>
+</footer>
+</article>
+</div>
+<script>(function(){var T='https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/track';function b(t,x){try{fetch(T,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({type:t,page:location.pathname,ref:document.referrer||''},x||{})),keepalive:true})}catch(e){}}b('pageview');document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&a.href&&/gumroad\.com|amazon\.com|\/l\/|calendly|cal\.com|\/Audit/.test(a.href)){b('cta_click',{meta:{href:a.href}})}},true)})();</script>
+</body>
+</html>

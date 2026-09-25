@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to Right-Size GPU Requests in Kubernetes</title>
+<meta name="description" content="nvidia.com/gpu is integer-only and request must equal limit — no GPU overcommit. Right-sizing GPU requests means measuring utilization from DCGM, then time-slicing, MIG, MPS and bin-packing.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/right-size-gpu-requests-kubernetes.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="How to Right-Size GPU Requests in Kubernetes">
+<meta property="og:description" content="nvidia.com/gpu is integer-only with request==limit — no overcommit. What right-sizing actually means for GPUs.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/right-size-gpu-requests-kubernetes.html">
+<meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"Article","headline":"How to Right-Size GPU Requests in Kubernetes","author":{"@type":"Person","name":"Altostratus — AI-infrastructure engineering"},"mainEntityOfPage":"https://gpu-cost.altostratus.biz/right-size-gpu-requests-kubernetes.html"}
+</script>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Can you request a fractional GPU in Kubernetes?","acceptedAnswer":{"@type":"Answer","text":"Not in the pod spec. nvidia.com/gpu is an integer extended resource; fractional sharing is implemented at the device-plugin layer via time-slicing, MIG or MPS."}},{"@type":"Question","name":"Does nvidia.com/gpu request have to equal the limit?","acceptedAnswer":{"@type":"Answer","text":"Yes. Extended-resource requests must equal their limits, so there is no CPU-style GPU overcommit or bursting — the allocation is fixed."}}]}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}h3{font-size:1.12rem;margin-top:1.6rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>How to Right-Size GPU Requests in Kubernetes</h1>
+<p class="lead">Right-sizing on CPU is simple: measure usage, lower the request, pack more pods on. For GPUs that playbook hits a wall — <strong>you cannot request a fractional GPU, and you cannot overcommit one</strong>. Right-sizing GPUs means choosing the right sharing mechanism, backed by real measurement.</p>
+<div class="box">💡 Put a number on the waste first: the <a href="/">free GPU Idle-Cost Calculator</a> turns fleet size and utilization into an annual figure in two minutes.</div>
+
+<h2>The constraint that changes everything</h2>
+<p>GPUs are an <strong>extended resource</strong>, <code>nvidia.com/gpu</code>, advertised by the NVIDIA device plugin — and two rules follow. First, it is <strong>integer only</strong>: <code>1</code> is valid, <code>0.5</code> is rejected. Second, <strong>request must equal limit</strong>: Kubernetes requires extended-resource requests to equal their limits, killing the CPU trick of a low request with a high limit. <strong>There is no GPU overcommit and no bursting</strong> — a scheduled pod fully reserves the card and bills as fully used whether it runs at 5% or 95%.</p>
+<pre><code>resources:
+  limits:
+    nvidia.com/gpu: 1     # request implied equal; no 0.5</code></pre>
+<p>So the CPU lever — shave the request — does not exist. The waste is a whole card handed to a workload that needs a sliver, and right-sizing is about sharing that card safely.</p>
+
+<h2>Step 1: measure real utilization first</h2>
+<p>The intuition "this model is small, so it under-uses the GPU" is unreliable — some small models are memory-bandwidth bound and saturate a card. Get the truth from <a href="/dcgm-prometheus-grafana-gpu-monitoring.html">DCGM</a>: <code>DCGM_FI_PROF_SM_ACTIVE</code> and <code>DCGM_FI_PROF_PIPE_TENSOR_ACTIVE</code> for real compute activity (not the coarse <code>DCGM_FI_DEV_GPU_UTIL</code>), and <code>DCGM_FI_DEV_FB_USED</code> for the VRAM footprint that decides how many co-tenants fit. Workloads worth sharing sit low on both: notebooks, CI, and bursty inference.</p>
+
+<h2>Step 2: pick a sharing strategy per workload</h2>
+<p>Fractional GPUs are delivered one layer down, by the device plugin. <strong>Time-slicing</strong> (via the GPU Operator) advertises a card as N replicas that take turns on it, with <em>no memory or fault isolation</em> — ideal for dev, CI and light inference, wrong for isolated tenants. <strong>MIG</strong>, on A100/H100 and newer, hardware-partitions a card into isolated instances with dedicated memory and compute (fixed profiles such as <code>1g.10gb</code> or <code>3g.40gb</code> on an A100-80GB); see <a href="/gpu-time-slicing-vs-mig-kubernetes.html">time-slicing vs MIG</a>. <strong>MPS</strong> adds concurrent submission with a per-client memory cap, but still no fault isolation. A job that saturates a card should keep it.</p>
+
+<h2>Step 3: bin-pack, and separate by latency class</h2>
+<p>Placement decides whether you reclaim the capacity. Thin spreading re-creates fragmentation, so prefer a bin-packing posture (the <code>MostAllocated</code> scoring strategy in the scheduler's <code>NodeResourcesFit</code> plugin) that fills nodes and leaves whole free nodes for large jobs. Never time-slice a latency-sensitive service onto the same card as a heavy batch job — with no isolation, the batch bursts become tail-latency spikes. Keep serving on whole cards or dedicated MIG instances and dev/batch/CI on shared pools steered with taints. Measure from DCGM, match each workload to a strategy, bin-pack, and separate — that moves a fleet from ~30% toward the 60–70% range.</p>
+
+<div class="cta">
+The strategy is clear; the hard part is finding <em>which</em> of your workloads are safe to share — on your real cluster, from your real telemetry. That is what a <a href="https://altostratus.biz/Audit">GPU Cost &amp; Reliability Audit</a> does: measure it, map each workload to a strategy, and hand you the config.<br><br>
+Start with the number: the <a href="/">free GPU Idle-Cost Calculator →</a>
+</div>
+
+<div class="box">
+<strong>Get the next field note.</strong> Practical, occasional notes on GPU/K8s scheduling and cost — the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'right-size-gpu-requests'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+
+<h2>Related reading</h2>
+<p>See real utilization with <a href="/dcgm-prometheus-grafana-gpu-monitoring.html">DCGM, Prometheus &amp; Grafana</a>, choose <a href="/gpu-time-slicing-vs-mig-kubernetes.html">time-slicing vs MIG</a>, understand <a href="/kubernetes-gpu-scheduling-cost.html">why clusters sit 30–50% idle</a>, and <a href="/reduce-llm-inference-cost-kubernetes.html">reduce LLM inference cost</a>.</p>
+
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your GPUs behave in production.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/kubernetes-gpu-scheduling-cost.html">GPU Scheduling &amp; Idle Cost</a> · <a href="/gpu-time-slicing-vs-mig-kubernetes.html">Time-slicing vs MIG</a> · <a href="/dcgm-prometheus-grafana-gpu-monitoring.html">GPU Monitoring with DCGM</a> · <a href="/reduce-llm-inference-cost-kubernetes.html">Reduce LLM Inference Cost</a></p>
+<p>Not affiliated with NVIDIA. Time-slicing, MIG and MPS require the NVIDIA GPU Operator / device plugin; supported profiles and behavior vary by GPU and version — validate against what you run.</p>
+</footer>
+</article>
+</div>
+<script>(function(){var T='https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/track';function b(t,x){try{fetch(T,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({type:t,page:location.pathname,ref:document.referrer||''},x||{})),keepalive:true})}catch(e){}}b('pageview');document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&a.href&&/gumroad\.com|amazon\.com|\/l\/|calendly|cal\.com|\/Audit/.test(a.href)){b('cta_click',{meta:{href:a.href}})}},true)})();</script>
+</body>
+</html>
