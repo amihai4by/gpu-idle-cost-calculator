@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to Audit GPU Utilization on a Kubernetes Cluster</title>
+<meta name="description" content="Concrete methods to measure real GPU utilization in Kubernetes: DCGM metrics, profiling fields, pod-level attribution, and the gap between busy and productive.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/audit-gpu-utilization-kubernetes-cluster.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="How to Audit GPU Utilization on a Kubernetes Cluster">
+<meta property="og:description" content="Concrete methods to measure real GPU utilization in Kubernetes: DCGM metrics, profiling fields, pod-level attribution, and the gap between busy and productive.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/audit-gpu-utilization-kubernetes-cluster.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="How to Audit GPU Utilization on a Kubernetes Cluster">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "How to Audit GPU Utilization on a Kubernetes Cluster",
+  "description": "Concrete methods to measure real GPU utilization in Kubernetes: DCGM metrics, profiling fields, pod-level attribution, and the gap between busy and productive.",
+  "author": {
+    "@type": "Person",
+    "name": "Altostratus — AI-infrastructure engineering"
+  },
+  "mainEntityOfPage": "https://gpu-cost.altostratus.biz/audit-gpu-utilization-kubernetes-cluster.html"
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Why is DCGM_FI_DEV_GPU_UTIL often misleading for judging real utilization?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "DCGM_FI_DEV_GPU_UTIL reports the percentage of time the GPU had at least one active kernel on any SM, so it can read high even when most SMs are idle or when kernels are memory-bound and the compute units are stalled. Use DCGM_FI_PROF_SM_ACTIVE, DCGM_FI_PROF_SM_OCCUPANCY, and DCGM_FI_PROF_PIPE_TENSOR_ACTIVE to measure true compute and Tensor Core activity."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I attribute GPU metrics to individual pods in a multi-tenant cluster?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "DCGM exporter labels metrics with gpu and UUID, but not pod name by default. You must join GPU metrics with pod-to-device mappings from the device plugin's resource allocation (visible in the pod spec as nvidia.com/gpu and in node allocatable/capacity) or use a sidecar that queries the NVML device handle and correlates process IDs to cgroup/pod. The Kubernetes downward API can inject pod metadata into the workload for self-reporting."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What is the maximum number of MIG instances I can create on one GPU?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The maximum is seven 1g profiles per GPU, because a GPU is divided into seven compute slices and eight memory slices, and the compute-slice budget is the binding constraint. Larger profiles yield fewer instances: 2g profiles max three per GPU, 3g profiles max two per GPU, and 4g or 7g profiles max one per GPU."
+      }
+    }
+  ]
+}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}h3{font-size:1.12rem;margin-top:1.6rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+table{width:100%;border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.5rem;border-bottom:1px solid var(--border);font-size:.95rem}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>How to Audit GPU Utilization on a Kubernetes Cluster</h1>
+<p class="lead">GPU utilization audits fail when teams rely on coarse GPU-busy percentages that hide whether workloads are compute-bound, memory-bound, or simply idle between batches. The dominant cost of an idle GPU is not electricity—it is the amortized capital or the reserved hourly price you pay whether the GPU is 5% or 95% utilized. A proper audit surfaces which pods are holding GPUs at low true utilization, quantifies the gap between allocated and productive capacity, and provides the data needed to justify consolidation, right-sizing, or reclaiming underused reservations.</p>
+<div class="box">💡 Put a number on it first: the <a href="/">free GPU Idle-Cost Calculator</a> turns fleet size + utilization into an annual waste figure. Two minutes, no signup.</div>
+<h2>The Real Cost of Low Utilization</h2>
+
+<p>An idle GPU draws a fraction of its TDP—tens of watts versus the hundreds of watts under load—but electricity is not the lever. The A100 SXM has a TDP around 400 W; the H100 SXM around 700 W. At typical data-center power costs, the difference between idle and full load is a few dollars per GPU per month. The dominant cost is the amortized capital expense or the reserved cloud hourly rate, which you pay in full whether the GPU runs inference at 80% SM occupancy or sits idle waiting for the next job. This is why utilization, not wattage, is the audit target.</p>
+
+<p>The payoff from an audit is concrete: identifying pods that hold entire GPUs but use them sporadically lets you consolidate workloads via MIG, time-slicing, or batch-queue policies, reclaiming capacity without new hardware. Quantifying the gap between allocated GPUs (the integer count in pod requests) and productive GPU-hours provides the data to justify infrastructure changes or to challenge teams claiming they need more quota.</p>
+
+<h2>Instrumentation: DCGM and the Profiling Metrics</h2>
+
+<p>DCGM (Data Center GPU Manager) is NVIDIA's telemetry daemon. The <code>dcgm-exporter</code> DaemonSet, typically deployed via the GPU Operator, scrapes DCGM and exposes metrics in Prometheus format on each node. The most commonly graphed metric, <code>DCGM_FI_DEV_GPU_UTIL</code>, reports the percentage of time the GPU had at least one active kernel on any streaming multiprocessor. This metric can read 90% while the GPU is severely underutilized—if kernels are memory-bound and the SMs are stalled waiting for DRAM, or if only a small fraction of SMs have work, GPU_UTIL still reports the GPU as busy.</p>
+
+<p>The profiling fields give truer utilization. <code>DCGM_FI_PROF_SM_ACTIVE</code> measures the fraction of cycles where at least one warp was active on the SMs, averaged across all SMs. <code>DCGM_FI_PROF_SM_OCCUPANCY</code> is the ratio of active warps to maximum theoretical warps. <code>DCGM_FI_PROF_PIPE_TENSOR_ACTIVE</code> reports Tensor Core activity, critical for transformer inference and training. <code>DCGM_FI_PROF_DRAM_ACTIVE</code> shows memory-controller utilization, revealing memory-bound workloads. <code>DCGM_FI_PROF_PCIE_TX_BYTES</code> and <code>DCGM_FI_PROF_PCIE_RX_BYTES</code> track PCIe traffic, useful for diagnosing host-to-device transfer bottlenecks.</p>
+
+<p>These profiling metrics require DCGM to enable the profiling (DCP) mode, which adds modest overhead. The GPU Operator's <code>dcgm-exporter</code> ConfigMap can be edited to include the <code>DCGM_FI_PROF_*</code> fields. Once enabled, you can query Prometheus for <code>DCGM_FI_PROF_SM_ACTIVE{gpu="0",UUID="..."}</code> and compare it to <code>DCGM_FI_DEV_GPU_UTIL</code>. A large gap—GPU_UTIL at 85% but SM_ACTIVE at 30%—indicates the workload is not compute-limited, and the GPU is underused despite appearing busy.</p>
+
+<h2>Pod-Level Attribution</h2>
+
+<p>DCGM metrics are labeled by <code>gpu</code> index and <code>UUID</code>, but not by pod name or namespace. To attribute utilization to individual pods, you must join GPU telemetry with the pod-to-device mapping. The Kubernetes device plugin allocates GPUs by setting the pod's resource limit <code>nvidia.com/gpu</code> to an integer count, and the kubelet binds specific device IDs to the container's cgroup. This mapping is not exposed as a first-class API object; you must either inspect the device plugin's internal state or correlate GPU processes with pod cgroups.</p>
+
+<p>One approach is to deploy a sidecar or node-level agent that queries NVML (NVIDIA Management Library) to list processes on each GPU, retrieves their process IDs, and maps those PIDs to Kubernetes pod UIDs via <code>/proc/&lt;pid&gt;/cgroup</code>. The cgroup path contains the pod UID, which you can resolve to pod name and namespace by querying the Kubernetes API. This sidecar can then label or re-export DCGM metrics with pod metadata, or write time-series records to a database for later analysis.</p>
+
+<p>A simpler method for batch or inference workloads is to have each pod self-report its GPU usage. The Kubernetes downward API can inject the pod name, namespace, and UID as environment variables. The workload process can then periodically query its own GPU metrics via NVML or the DCGM API and emit them to a logging or metrics backend with pod labels attached. This requires modifying the workload or wrapping it in a monitoring shim, but it avoids the complexity of external process-to-pod correlation.</p>
+
+<h2>Measuring Allocation vs. Productive Utilization</h2>
+
+<p>The audit must distinguish between <em>allocated</em> GPU-hours and <em>productive</em> GPU-hours. Allocated GPU-hours are straightforward: sum the count of <code>nvidia.com/gpu</code> in each pod's resource limits, multiplied by the pod's runtime. Productive GPU-hours require a utilization threshold—for example, counting only the time when <code>DCGM_FI_PROF_SM_ACTIVE</code> exceeds 50%, or when <code>DCGM_FI_PROF_PIPE_TENSOR_ACTIVE</code> is above 40% for Tensor-Core workloads. The threshold depends on workload type: training runs often sustain high SM activity, while inference serving may have bursty utilization between requests.</p>
+
+<p>Construct a time-series query that, for each GPU, calculates the fraction of time above the threshold over a measurement window (e.g., one week). Multiply that fraction by the number of GPUs allocated to each pod to estimate productive GPU-hours per pod. Compare the sum of productive GPU-hours to the sum of allocated GPU-hours across the cluster. A ratio of 0.6 means 40% of allocated GPU capacity was unproductive by your threshold—this is the waste figure that justifies intervention.</p>
+
+<h2>Identifying Underutilized Pods and Workload Patterns</h2>
+
+<p>Rank pods by their productive-utilization ratio (productive GPU-hours divided by allocated GPU-hours) over the audit period. Pods at the bottom of the list—those with ratios below 20%—are candidates for consolidation or right-sizing. Inspect their utilization time-series to distinguish between different underutilization patterns:</p>
+
+<ul>
+<li><strong>Idle between jobs:</strong> The pod holds a GPU allocation but runs inference or training tasks sporadically, with long gaps of zero activity. These workloads are candidates for batch queuing (e.g., via Slurm or Volcano) or for moving to a shared MIG or time-sliced pool where the GPU is released between jobs.</li>
+<li><strong>Memory-bound:</strong> <code>DCGM_FI_DEV_GPU_UTIL</code> is high but <code>DCGM_FI_PROF_SM_ACTIVE</code> and <code>DCGM_FI_PROF_PIPE_TENSOR_ACTIVE</code> are low, while <code>DCGM_FI_PROF_DRAM_ACTIVE</code> is high. The workload is bottlenecked on memory bandwidth, not compute. Optimizations include increasing batch size (if memory allows), fusing kernels to reduce DRAM round-trips, or using quantization to shrink model weights and activations.</li>
+<li><strong>Small-batch inference:</strong> The pod runs an LLM or vision model with small request batches, so each forward pass is short and the GPU idles waiting for the next request. Continuous batching (as in vLLM) or request aggregation can increase utilization, or the workload can be moved to a smaller MIG instance (e.g., 1g or 2g) to free the rest of the GPU for other pods.</li>
+</ul>
+
+<h2>MIG and Time-Slicing for Consolidation</h2>
+
+<p>Multi-Instance GPU (MIG) partitions one physical GPU into isolated instances with hardware-level memory, cache, and fault isolation. Each MIG instance has a fixed slice of streaming multiprocessors and memory. A GPU is divided into seven compute slices and eight memory slices, so the maximum number of MIG instances is seven (seven 1g profiles). Profile naming is <code>&lt;compute-slices&gt;g.&lt;memory&gt;gb</code>. The compute-slice budget is seven, so the maximum count of a profile per GPU is <code>floor(7 / compute-slices)</code>: 1g profiles max seven per GPU, 2g profiles max three per GPU (2+2+2=6), 3g profiles max two per GPU (3+3=6; a third would require nine slices), and 4g or 7g profiles max one per GPU.</p>
+
+<p>On the A100-40GB, profiles are <code>1g.5gb</code>, <code>2g.10gb</code>, <code>3g.20gb</code>, <code>4g.20gb</code>, and <code>7g.40gb</code> (memory slice = 5 GB). On the A100-80GB and H100-80GB, profiles are <code>1g.10gb</code>, <code>2g.20gb</code>, <code>3g.40gb</code>, <code>4g.40gb</code>, and <code>7g.80gb</code> (memory slice = 10 GB). Note that <code>3g.40gb</code> exists only on 80GB parts; on the A100-40GB the 3-slice profile is <code>3g.20gb</code>.</p>
+
+<p>MIG is exposed to Kubernetes via the NVIDIA device plugin. You configure MIG profiles on the node (via <code>nvidia-smi mig</code> commands or the GPU Operator's MIG manager), and the device plugin advertises each MIG instance as a separate resource, e.g., <code>nvidia.com/mig-1g.5gb</code>. Pods request MIG instances by specifying the corresponding resource in their limits. Because MIG instances are hardware-isolated, an out-of-memory error or crash in one instance does not affect others on the same GPU.</p>
+
+<p>Time-slicing, by contrast, multiplexes the whole GPU in time across multiple pods. It has no memory isolation and no fault isolation—an OOM or kernel crash in one pod can disrupt others sharing the GPU. Time-slicing is configured via the device plugin's config map, where you set a <code>replicas</code> count per GPU. The device plugin then advertises <code>nvidia.com/gpu</code> with a capacity equal to <code>physical_gpu_count × replicas</code>. Pods still request an integer count of <code>nvidia.com/gpu</code>, but multiple pods may be scheduled to the same physical device. Time-slicing is simpler to configure than MIG and works on GPUs that do not support MIG (e.g., consumer or older datacenter cards), but it provides no isolation guarantees.</p>
+
+<h2>Draining Nodes for Reconfiguration</h2>
+
+<p>Changing MIG profiles or device-plugin configuration requires draining GPU nodes to evict running pods. The <code>kubectl drain</code> command cordons the node (marks it unschedulable) and then evicts pods via the Eviction API, which respects PodDisruptionBudgets. Key flags:</p>
+
+<pre><code>kubectl drain &lt;node&gt; \
+  --ignore-daemonsets \
+  --delete-emptydir-data \
+  --grace-period=300 \
+  --timeout=0
+</code></pre>
+
+<p><code>--ignore-daemonsets</code> is required in practice because DaemonSet pods (including the device plugin and DCGM exporter) are not evicted by drain. <code>--delete-emptydir-data</code> allows drain to evict pods using an <code>emptyDir</code> volume (without this flag, drain will refuse to evict them). <code>--grace-period</code> overrides the pod's <code>terminationGracePeriodSeconds</code>, giving workloads time to checkpoint or shut down cleanly. <code>--timeout=0</code> means wait forever (no timeout), not "give up immediately"—drain will block until all evictable pods terminate or you interrupt it.</p>
+
+<p>The <code>--disable-eviction</code> flag makes drain delete pods directly instead of using the Eviction API, which bypasses PodDisruptionBudgets and force-removes running pods. It does not "only delete completed pods"; it is a hammer that ignores disruption policies. Use it only when the Eviction API is unavailable or when you need to forcibly clear a node despite PDB constraints.</p>
+
+<p>After draining, reconfigure MIG profiles on the node (either manually via <code>nvidia-smi mig -cgi &lt;profile&gt; -C</code> or via the GPU Operator's MIG config CRD), restart the device plugin DaemonSet pod on that node to pick up the new profiles, then uncordon the node with <code>kubectl uncordon &lt;node&gt;</code>. Pods will reschedule to the newly available MIG resources.</p>
+
+<h2>Audit Reporting and Threshold Tuning</h2>
+
+<p>The output of the audit is a report listing each pod's allocated GPU-hours, productive GPU-hours, and utilization ratio over the measurement period, along with cluster-wide aggregates. Include a breakdown by namespace or team label to show which groups are under- or over-utilizing their allocations. Attach time-series graphs of key metrics—<code>DCGM_FI_PROF_SM_ACTIVE</code>, <code>DCGM_FI_PROF_PIPE_TENSOR_ACTIVE</code>, <code>DCGM_FI_PROF_DRAM_ACTIVE</code>—for the lowest-utilization pods to illustrate the specific bottleneck (idle, memory-bound, or low-batch).</p>
+
+<p>Threshold tuning is workload-dependent. For large-batch training, a productive-utilization threshold of 70% SM_ACTIVE is reasonable, because well-optimized training should keep SMs busy. For inference serving, bursty utilization is expected; a threshold of 30–40% may be more appropriate, or you may measure utilization only during request-handling windows (excluding idle time between requests). For Tensor-Core-heavy workloads (transformers, large matmuls), consider using <code>DCGM_FI_PROF_PIPE_TENSOR_ACTIVE</code> as the primary metric instead of SM_ACTIVE, since high SM_ACTIVE without Tensor Core activity indicates the workload is not leveraging the hardware's peak throughput.</p>
+
+<h2>Continuous Monitoring and Utilization Policies</h2>
+
+<p>A one-time audit provides a snapshot, but utilization patterns change as workloads evolve. Continuous monitoring with alerting on low utilization—e.g., a Prometheus alert firing when a pod's 24-hour average <code>DCGM_FI_PROF_SM_ACTIVE</code> falls below 20%—enables proactive intervention. Pair monitoring with policy: require teams to justify GPU requests above a certain count, implement auto-scaling for inference workloads to release GPUs during low-traffic periods, or use a batch scheduler (Slurm, Volcano, Kueue) that allocates GPUs only when jobs are running and releases them on completion.</p>
+
+<p>The mechanism that makes utilization audits actionable is the link between measurement and reclamation. Identifying underutilized pods is the first step; the second is having the tooling and process to consolidate those workloads onto fewer GPUs via MIG, time-slicing, or batch queuing, and the third is feeding the reclaimed capacity back into the allocation pool or decommissioning it to reduce cost. Without that closed loop, the audit remains a report rather than a lever for efficiency.</p>
+<div class="cta">
+Start with the number: the <a href="/">free GPU Idle-Cost Calculator</a> shows what your current utilization is costing per year, in two minutes.<br><br>
+For a human to find the waste on <em>your</em> actual cluster, book a <a href="https://altostratus.biz/Audit">GPU Cost &amp; Reliability Audit →</a>
+</div>
+<div class="box">
+<strong>Get the next field note.</strong> Practical, occasional notes on GPU/K8s cost, scheduling and reliability — the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'audit-gpu-utilization-kubernetes-cluster'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your GPUs behave in production.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/reduce-kubernetes-gpu-costs.html">Reduce Kubernetes GPU Costs</a> · <a href="/reduce-llm-inference-cost-kubernetes.html">Reduce LLM Inference Cost</a> · <a href="/kubernetes-gpu-scheduling-cost.html">GPU Scheduling &amp; Idle Cost</a> · <a href="/nvidia-gpu-operator-not-detecting-gpus.html">GPU Operator not detecting GPUs</a></p>
+<p>Not affiliated with NVIDIA or Run:AI. Behavior varies by version and hardware; validate against your own cluster.</p>
+</footer>
+</article>
+</div>
+<script>(function(){var T='https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/track';function b(t,x){try{fetch(T,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({type:t,page:location.pathname,ref:document.referrer||''},x||{})),keepalive:true})}catch(e){}}b('pageview');document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&a.href&&/gumroad\.com|amazon\.com|\/l\/|calendly|cal\.com|\/Audit/.test(a.href)){b('cta_click',{meta:{href:a.href}})}},true)})();</script>
+</body>
+</html>
