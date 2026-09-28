@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Cluster Reliability Checklist for Production AI Infrastructure</title>
+<meta name="description" content="Hardware validation, monitoring, and operational discipline for production GPU clusters. XID codes, DCGM metrics, drain procedures, and failure modes.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/gpu-cluster-reliability-checklist-production.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="GPU Cluster Reliability Checklist for Production AI Infrastructure">
+<meta property="og:description" content="Hardware validation, monitoring, and operational discipline for production GPU clusters. XID codes, DCGM metrics, drain procedures, and failure modes.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/gpu-cluster-reliability-checklist-production.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="GPU Cluster Reliability Checklist for Production AI Infrastructure">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "GPU Cluster Reliability Checklist for Production AI Infrastructure",
+  "description": "Hardware validation, monitoring, and operational discipline for production GPU clusters. XID codes, DCGM metrics, drain procedures, and failure modes.",
+  "author": {
+    "@type": "Person",
+    "name": "Altostratus — AI-infrastructure engineering"
+  },
+  "mainEntityOfPage": "https://gpu-cost.altostratus.biz/gpu-cluster-reliability-checklist-production.html"
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "What's the difference between XID 79 and XID 48, and why does it matter for my runbook?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "XID 79 means the GPU fell off the bus—a serious hardware or connection failure requiring node removal and RMA. XID 48 is a double-bit ECC error, also hardware, but the GPU may still be accessible for diagnostics. Both need immediate action, but 79 often means the node is unresponsive."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Why does DCGM_FI_DEV_GPU_UTIL show 95% but my training is slow?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "GPU_UTIL measures whether the SM had at least one active kernel, not how well the SMs are utilized. Use DCGM_FI_PROF_SM_ACTIVE and DCGM_FI_PROF_PIPE_TENSOR_ACTIVE to see real compute and Tensor Core usage—GPU_UTIL can read high while the GPU is starved or waiting on I/O."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Should I use kubectl drain --disable-eviction to speed up maintenance?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. --disable-eviction deletes pods directly, bypassing PodDisruptionBudgets and force-removing running workloads. Use the default Eviction API with --ignore-daemonsets and --delete-emptydir-data; set a reasonable --grace-period if needed, but respect PDBs."
+      }
+    }
+  ]
+}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}h3{font-size:1.12rem;margin-top:1.6rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+table{width:100%;border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.5rem;border-bottom:1px solid var(--border);font-size:.95rem}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>GPU Cluster Reliability Checklist for Production AI Infrastructure</h1>
+<p class="lead">A production GPU cluster fails differently than the CPU infrastructure most platform engineers learned on. Silent memory corruption, NVLink degradation, and thermal throttling can all masquerade as "slow training" for weeks before anyone notices. This checklist covers the hardware validation, monitoring, runbook discipline, and operational patterns that separate a reliable GPU platform from an expensive science experiment.</p>
+<div class="box">💡 Put a number on it first: the <a href="/">free GPU Idle-Cost Calculator</a> turns fleet size + utilization into an annual waste figure. Two minutes, no signup.</div>
+<h2>Pre-Deployment: Hardware Validation</h2>
+
+<p>Every GPU that enters production should pass a validation suite before it joins the scheduler pool. This is not paranoia—it's the difference between catching a flaky NVLink or marginal memory module during acceptance testing versus discovering it three weeks into a training run.</p>
+
+<h3>Burn-In and Memory Testing</h3>
+
+<p>Run a memory test that exercises the full framebuffer under thermal load. The NVIDIA diagnostic toolkit includes <code>nvidia-smi -q</code> for basic health and <code>dcgmi diag -r 3</code> for a longer diagnostic sweep that stresses compute, memory, and interconnect. A level-3 diagnostic typically takes 15–30 minutes per GPU and will catch most marginal hardware before it causes a production incident.</p>
+
+<p>Check for remapped rows and existing ECC errors. On A100 and newer, row remapping is logged via XID 63 (successful remapping recorded) and XID 64 (remapper exhausted). A GPU that has already remapped rows is not necessarily bad, but a high count or a failure to remap is a red flag. Query ECC counters with <code>nvidia-smi --query-gpu=ecc.errors.corrected.aggregate.total,ecc.errors.uncorrected.aggregate.total --format=csv</code> and establish a baseline.</p>
+
+<h3>NVLink and Interconnect Validation</h3>
+
+<p>NVLink bandwidth degrades silently. A single failed link in an NVSwitch topology can cut intra-node bandwidth by a seventh or more, and the training job will simply run slower without an obvious error. Use <code>nvidia-smi nvlink --status</code> to verify all links are active, then run a bandwidth test across the full node topology. The <code>nccl-tests</code> all_reduce_perf benchmark is the standard: it will report <code>algbw</code> (algorithm bandwidth, the effective rate seen by the application) and <code>busbw</code> (bus bandwidth, which for ring all-reduce is roughly twice algbw for large node counts).</p>
+
+<p>For intra-node validation, expect aggregate NVLink bandwidth per GPU around 600 GB/s on A100 (third-generation NVLink) and around 900 GB/s on H100 (fourth-generation). If you see significantly lower numbers, check <code>nvidia-smi topo -m</code> for topology issues and <code>nvidia-smi nvlink -e</code> for per-link error counters. XID 74 indicates an NVLink error; investigate immediately.</p>
+
+<h3>Network Fabric Validation</h3>
+
+<p>For multi-node collectives, the network is the long pole. Run <code>nccl-tests</code> across a representative multi-node job (at least four nodes, ideally a full rail or pod). On 200 Gb/s HDR InfiniBand, expect <code>busbw</code> approaching the per-GPU NIC line rate—roughly 23–25 GB/s per GPU for a network-bound all-reduce, not 40–45 GB/s. The busbw ceiling is the physical link rate divided by eight (200 Gb/s ≈ 25 GB/s) minus protocol overhead.</p>
+
+<p>If busbw is significantly lower, check for misconfigured NCCL topology (the <code>NCCL_TOPO_FILE</code> or auto-detected topology), verify that GPUDirect RDMA is enabled (<code>NCCL_NET=IB</code>, <code>NCCL_IB_GID_INDEX</code> set correctly), and confirm that the InfiniBand subnet manager has all links up. Use <code>ibstat</code> and <code>ibdiagnet</code> to validate fabric health.</p>
+
+<h2>Monitoring: The Metrics That Matter</h2>
+
+<p>DCGM (Data Center GPU Manager) is the standard telemetry source. The <code>dcgm-exporter</code> DaemonSet exposes metrics to Prometheus, and the key is knowing which metrics actually tell you something.</p>
+
+<h3>Utilization Metrics and the GPU_UTIL Trap</h3>
+
+<p><code>DCGM_FI_DEV_GPU_UTIL</code> is a coarse "GPU busy" percentage: it reports high if the SM had at least one active kernel during the sampling window, even if that kernel was blocked on memory or used only a fraction of the available parallelism. A GPU can show 95% GPU_UTIL while delivering 20% of its potential throughput because the workload is memory-bound or the batch size is too small.</p>
+
+<p>The profiling (DCP) fields give you the real picture:</p>
+
+<ul>
+<li><code>DCGM_FI_PROF_SM_ACTIVE</code>: the fraction of time the SMs were actively executing instructions.</li>
+<li><code>DCGM_FI_PROF_PIPE_TENSOR_ACTIVE</code>: the fraction of time the Tensor Cores were active (critical for transformer training).</li>
+<li><code>DCGM_FI_PROF_DRAM_ACTIVE</code>: memory controller utilization, which tells you if you're memory-bound.</li>
+<li><code>DCGM_FI_PROF_SM_OCCUPANCY</code>: average active warps per SM, a proxy for how well the kernel is hiding latency.</li>
+</ul>
+
+<p>Alert on low SM_ACTIVE or PIPE_TENSOR_ACTIVE when GPU_UTIL is high—that's the signature of a starved or misconfigured workload. Also monitor <code>DCGM_FI_DEV_MEM_COPY_UTIL</code> (memory controller utilization) as a simpler memory-bound indicator.</p>
+
+<h3>Hardware Health and Error Counters</h3>
+
+<p>Track <code>DCGM_FI_DEV_XID_ERRORS</code>, which reports the last XID error code. The critical XIDs for hardware failures are:</p>
+
+<table>
+<thead>
+<tr><th>XID Code</th><th>Meaning</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td>48</td><td>Double-bit ECC error (uncorrectable memory error)</td><td>Drain node, RMA GPU</td></tr>
+<tr><td>79</td><td>GPU fell off the bus (inaccessible)</td><td>Immediate node removal, RMA</td></tr>
+<tr><td>63</td><td>ECC page retirement recorded (A100+)</td><td>Log and monitor; check row-remap count</td></tr>
+<tr><td>64</td><td>Row remapper exhausted</td><td>Drain node, RMA GPU</td></tr>
+<tr><td>94/95</td><td>Contained/uncontained ECC error (A100+)</td><td>Drain node, RMA GPU</td></tr>
+</tbody>
+</table>
+
+<p>XID 13 (graphics engine exception) and XID 31 (memory page fault) are usually application errors (illegal memory access, out-of-bounds), not hardware faults. XID 43 (GPU stopped processing) is a software-level stop, not a hardware memory fault. Investigate the workload first; if the error is reproducible across different workloads or nodes, suspect hardware.</p>
+
+<p>Monitor ECC counters directly: <code>DCGM_FI_DEV_ECC_SBE_VOL_TOTAL</code> (single-bit errors, correctable) and <code>DCGM_FI_DEV_ECC_DBE_VOL_TOTAL</code> (double-bit errors, uncorrectable). A rising SBE count is normal over time, but a sudden spike or any DBE is a hardware red flag.</p>
+
+<h3>Thermal and Power</h3>
+
+<p>Set alerts on <code>DCGM_FI_DEV_GPU_TEMP</code> (GPU temperature in Celsius) and <code>DCGM_FI_DEV_POWER_USAGE</code> (power draw in watts). Thermal throttling is silent—clock speeds drop (<code>DCGM_FI_DEV_SM_CLOCK</code>, <code>DCGM_FI_DEV_MEM_CLOCK</code>) and throughput falls, but the job keeps running. If temperature consistently exceeds the thermal design point (typically mid-80s Celsius for most datacenter GPUs under load), check cooling: airflow obstructions, failed fans, or inadequate facility cooling.</p>
+
+<p>An idle GPU does not draw the same power as a busy one—idle draw is a fraction of TDP (tens of watts versus hundreds under load). The A100 SXM is around 400 W at full load, the H100 SXM around 700 W. The dominant cost of an idle GPU is not electricity; it's the amortized capital cost or the reserved hourly price, which you pay regardless of utilization. This is why utilization metrics matter more than wattage for cost control.</p>
+
+<h2>Operational Runbooks</h2>
+
+<h3>Draining Nodes Safely</h3>
+
+<p>Use <code>kubectl drain</code> with the Eviction API, not direct deletion. The correct incantation for a GPU node is:</p>
+
+<pre><code>kubectl drain &lt;node&gt; \
+  --ignore-daemonsets \
+  --delete-emptydir-data \
+  --grace-period=300
+</code></pre>
+
+<p>The <code>--ignore-daemonsets</code> flag is required because DaemonSet pods are not evicted (they are managed by the DaemonSet controller, which will reschedule them when the node is uncordoned). The <code>--delete-emptydir-data</code> flag is required to evict pods using an <code>emptyDir</code> volume, which is common for scratch space in training jobs.</p>
+
+<p>The <code>--grace-period</code> overrides the pod's <code>terminationGracePeriodSeconds</code>. The default <code>--timeout</code> is zero, which means wait forever (no timeout), not "give up immediately." If you need a timeout, set it explicitly (e.g., <code>--timeout=600s</code>).</p>
+
+<p>Never use <code>--disable-eviction</code> unless you understand the consequences: it deletes pods directly, bypassing PodDisruptionBudgets and force-removing running workloads. This is appropriate only for a node that is unresponsive or in a failure state where the Eviction API does not work.</p>
+
+<h3>Handling XID Events</h3>
+
+<p>When an XID alert fires, the first step is triage: is this a hardware fault (48, 79, 64, 94, 95) or an application issue (13, 31, 43)? For hardware faults, cordon the node immediately (<code>kubectl cordon &lt;node&gt;</code>), then drain it. For application issues, inspect the workload logs and the GPU state with <code>nvidia-smi</code> and <code>dcgmi diag</code>.</p>
+
+<p>If the GPU is still accessible, capture diagnostics before draining: <code>nvidia-smi -q</code>, <code>nvidia-bug-report.sh</code>, and <code>dcgmi diag -r 3</code>. These logs are critical for RMA and root-cause analysis. If the GPU has fallen off the bus (XID 79), the node may be unresponsive; you may need to force-delete pods and reboot the node out-of-band.</p>
+
+<h3>Firmware and Driver Updates</h3>
+
+<p>GPU firmware and driver updates carry risk. Test updates on a canary node or a non-production cluster first, and validate with the same burn-in suite you use for new hardware. A driver regression can introduce silent correctness issues (wrong results) or performance regressions that are hard to attribute after the fact.</p>
+
+<p>Coordinate driver updates with the CUDA version and the container base images your workloads use. The NVIDIA driver is backward-compatible (a newer driver supports older CUDA toolkits), but forward compatibility is limited. Pin driver versions in your node image or use the NVIDIA GPU Operator to manage driver lifecycle, and roll updates in waves with validation between waves.</p>
+
+<h2>Capacity and Scheduling Discipline</h2>
+
+<h3>Resource Requests and Limits</h3>
+
+<p>The GPU extended resource is <code>nvidia.com/gpu</code>, and it is integer-only: you cannot request a fraction of a physical GPU in the standard device plugin. Kubernetes requires that for extended resources, request equals limit (you specify the limit, and the request is set equal). This means a pod requesting one GPU will be scheduled only on a node with at least one free GPU, and it will hold that GPU exclusively unless you configure MIG or time-slicing.</p>
+
+<p>MIG (Multi-Instance GPU) partitions a physical GPU into isolated instances with hardware-level memory and fault isolation. A GPU is divided into seven compute slices and eight memory slices, so the maximum number of MIG instances on one GPU is seven (seven 1g profiles). Profile naming is <code>&lt;compute-slices&gt;g.&lt;memory&gt;gb</code>. For example, on an A100-80GB, the profiles are <code>1g.10gb</code>, <code>2g.20gb</code>, <code>3g.40gb</code>, <code>4g.40gb</code>, and <code>7g.80gb</code>. The compute-slice budget is seven, so the maximum count of a profile per GPU is <code>floor(7 / compute-slices)</code>: you can fit seven 1g instances, three 2g instances, two 3g instances, or one 4g or 7g instance per GPU.</p>
+
+<p>Time-slicing multiplexes the whole GPU in time across processes. It has no memory isolation and no fault isolation—an OOM or crash in one workload can affect others sharing the GPU, and there is no hard memory cap per client. Time-slicing is useful for inference or low-priority jobs where isolation is less critical, but it is not a substitute for MIG in multi-tenant training environments.</p>
+
+<h3>PodDisruptionBudgets for Training Jobs</h3>
+
+<p>Set a PodDisruptionBudget (PDB) for multi-GPU training jobs so that <code>kubectl drain</code> does not evict the entire job at once. A typical PDB for a distributed training job allows zero voluntary disruptions (<code>maxUnavailable: 0</code>), forcing the operator to pause the job or wait for a checkpoint before draining nodes. This prevents the job from being split across a maintenance event and losing hours of training progress.</p>
+
+<p>For inference or batch workloads that can tolerate restarts, set a more permissive PDB (e.g., <code>minAvailable: 50%</code>) to allow rolling maintenance. The key is aligning the PDB policy with the workload's tolerance for disruption and the cost of a restart.</p>
+
+<h2>Failure Modes and Detection Latency</h2>
+
+<p>The insidious failure modes in GPU clusters are the ones that do not trigger an immediate alert. A single degraded NVLink can slow a training job by a few percent, and the slowdown is attributed to "variance" until someone runs a bandwidth test. A GPU with a marginal memory module may pass <code>nvidia-smi</code> but fail under sustained load hours into a job, producing a cryptic CUDA error.</p>
+
+<p>The defense is continuous validation: run lightweight health checks (memory bandwidth, NVLink bandwidth, ECC counters) on a schedule (e.g., daily or before every job) and compare against baseline metrics. Use the DCGM health check feature (<code>dcgmi health -g &lt;group&gt; -c</code>) to automate this. Alert on deviations from baseline, not just hard failures.</p>
+
+<p>For correctness, consider checksum validation or known-answer tests in your training pipeline. Silent data corruption (from a flaky GPU or a bit flip in transit) is rare but not impossible, and the symptom is a model that diverges or produces nonsense results. A periodic validation pass on a known dataset can catch this before you waste weeks of compute.</p>
+
+<h2>Conclusion</h2>
+
+<p>Reliability in a GPU cluster is not a one-time setup; it is a discipline of validation, monitoring, and operational rigor. The checklist is: validate hardware before it enters production, monitor the metrics that reveal real utilization and hardware health (not just GPU_UTIL), use drain and eviction procedures that respect workload boundaries, and build runbooks for the failure modes you will see—XID events, thermal issues, and silent degradation. The goal is to catch problems early, when they are cheap to fix, rather than discovering them three weeks into a training run.</p>
+<div class="cta">
+Start with the number: the <a href="/">free GPU Idle-Cost Calculator</a> shows what your current utilization is costing per year, in two minutes.<br><br>
+For a human to find the waste on <em>your</em> actual cluster, book a <a href="https://altostratus.biz/Audit">GPU Cost &amp; Reliability Audit →</a>
+</div>
+<div class="box">
+<strong>Get the next field note.</strong> Practical, occasional notes on GPU/K8s cost, scheduling and reliability — the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'gpu-cluster-reliability-checklist-production'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your GPUs behave in production.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/reduce-kubernetes-gpu-costs.html">Reduce Kubernetes GPU Costs</a> · <a href="/reduce-llm-inference-cost-kubernetes.html">Reduce LLM Inference Cost</a> · <a href="/kubernetes-gpu-scheduling-cost.html">GPU Scheduling &amp; Idle Cost</a> · <a href="/nvidia-gpu-operator-not-detecting-gpus.html">GPU Operator not detecting GPUs</a></p>
+<p>Not affiliated with NVIDIA or Run:AI. Behavior varies by version and hardware; validate against your own cluster.</p>
+</footer>
+</article>
+</div>
+<script>(function(){var T='https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/track';function b(t,x){try{fetch(T,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({type:t,page:location.pathname,ref:document.referrer||''},x||{})),keepalive:true})}catch(e){}}b('pageview');document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&a.href&&/gumroad\.com|amazon\.com|\/l\/|calendly|cal\.com|\/Audit/.test(a.href)){b('cta_click',{meta:{href:a.href}})}},true)})();</script>
+</body>
+</html>
