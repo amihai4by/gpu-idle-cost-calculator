@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU FinOps: Reducing AI Infrastructure Cost Without Waste</title>
+<meta name="description" content="Practical GPU cost reduction for AI clusters: right-sizing MIG, fixing idle waste, optimizing batch, and measuring real utilization with DCGM profiling metrics.">
+<link rel="canonical" href="https://gpu-cost.altostratus.biz/gpu-finops-reducing-ai-infrastructure-cost.html">
+<meta name="robots" content="index,follow">
+<meta property="og:type" content="article">
+<meta property="og:title" content="GPU FinOps: Reducing AI Infrastructure Cost Without Waste">
+<meta property="og:description" content="Practical GPU cost reduction for AI clusters: right-sizing MIG, fixing idle waste, optimizing batch, and measuring real utilization with DCGM profiling metrics.">
+<meta property="og:url" content="https://gpu-cost.altostratus.biz/gpu-finops-reducing-ai-infrastructure-cost.html">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="GPU FinOps: Reducing AI Infrastructure Cost Without Waste">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Article",
+  "headline": "GPU FinOps: Reducing AI Infrastructure Cost Without Waste",
+  "description": "Practical GPU cost reduction for AI clusters: right-sizing MIG, fixing idle waste, optimizing batch, and measuring real utilization with DCGM profiling metrics.",
+  "author": {
+    "@type": "Person",
+    "name": "Altostratus — AI-infrastructure engineering"
+  },
+  "mainEntityOfPage": "https://gpu-cost.altostratus.biz/gpu-finops-reducing-ai-infrastructure-cost.html"
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "What is the real cost of an idle GPU?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "The dominant cost is the amortized capital or the reserved hourly price you pay regardless of utilization, not the electricity. An idle A100 draws tens of watts versus hundreds under load, but the rental or capital amortization is the same whether the GPU is 5% or 95% utilized."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How do I measure true GPU utilization versus just seeing high GPU-busy percentages?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "DCGM_FI_DEV_GPU_UTIL reports coarse GPU-busy time and can read high even when SMs are underused. Use DCGM profiling metrics—DCGM_FI_PROF_SM_ACTIVE, DCGM_FI_PROF_SM_OCCUPANCY, and DCGM_FI_PROF_PIPE_TENSOR_ACTIVE—to see real compute and Tensor Core utilization."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Can I fit four 3g MIG instances on one A100 GPU?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. MIG divides a GPU into 7 compute slices, so the maximum count of a profile is floor(7 / compute-slices). A 3g profile uses 3 slices, so you can fit at most 2 per GPU (3+3=6 ≤ 7); a third would require 9 slices."
+      }
+    }
+  ]
+}
+</script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#5e5e5f;--card:#f6f8fa;--border:#e2e6ea;--accent:#00afa9;--accent2:#70d4b4}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1214;--fg:#e8ebed;--muted:#9aa2a8;--card:#171b1e;--border:#262c31}}
+*{box-sizing:border-box}body{margin:0;font:17px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:760px;margin:0 auto;padding:2rem 1.2rem 4rem}
+h1{font-size:2rem;line-height:1.2}h2{font-size:1.4rem;margin-top:2.4rem}h3{font-size:1.12rem;margin-top:1.6rem}
+a{color:var(--accent)}
+.lead{font-size:1.15rem;color:var(--muted)}
+.box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem 1.2rem;margin:1.5rem 0}
+.cta{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04211f;border-radius:12px;padding:1.1rem 1.2rem;margin:2rem 0;font-weight:600}
+.cta a{color:#04211f;font-weight:800}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;font-size:.9rem}
+code{background:var(--card);padding:2px 6px;border-radius:4px;font-size:.9em}
+pre code{background:none;padding:0}
+table{width:100%;border-collapse:collapse;margin:1rem 0}th,td{text-align:left;padding:.5rem;border-bottom:1px solid var(--border);font-size:.95rem}
+footer{margin-top:3rem;padding-top:1.4rem;border-top:1px solid var(--border);color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<article>
+<h1>GPU FinOps: Reducing AI Infrastructure Cost Without Waste</h1>
+<p class="lead">GPU clusters represent the largest line item in most AI infrastructure budgets, yet the dominant cost driver is not electricity—it is underutilization. A reserved or owned GPU costs the same per hour whether it runs at 10% or 90% utilization, and the capital or rental amortization dwarfs the incremental power cost. Reducing waste means improving utilization through right-sizing, batch optimization, and eliminating idle allocation, all guided by correct measurement of what the GPU is actually doing.</p>
+<div class="box">💡 Put a number on it first: the <a href="/">free GPU Idle-Cost Calculator</a> turns fleet size + utilization into an annual waste figure. Two minutes, no signup.</div>
+<h2>The Dominant Cost: Amortized Capital and Reserved Capacity</h2>
+
+<p>The first discipline in GPU FinOps is understanding where the money actually goes. An A100 SXM GPU has a TDP around 400 W and draws tens of watts when idle versus hundreds under load, but the incremental electricity cost of that difference is a small fraction of the total. The overwhelming cost is the amortized capital expenditure if you own the hardware, or the reserved hourly price if you rent from a cloud or colo provider. That cost is fixed per hour regardless of whether the GPU runs a single inference request or sustains 95% utilization on a training job.</p>
+
+<p>This means the primary lever for cost reduction is <strong>utilization</strong>: ensuring that every GPU-hour you pay for produces useful work. Underutilization—GPUs sitting idle in a reserved pool, or running workloads that use only a fraction of the available compute—is pure waste of the capital or rental cost. Improving utilization does not mean running the GPU hotter or drawing more power; it means filling the capacity you have already paid for.</p>
+
+<h2>Measuring Real Utilization with DCGM Profiling Metrics</h2>
+
+<p>The standard GPU utilization metric exported by DCGM is <code>DCGM_FI_DEV_GPU_UTIL</code>, which reports the percentage of time the GPU had at least one active kernel. This metric is coarse: it can read 80% or 90% even when the streaming multiprocessors (SMs) are lightly loaded, because any kernel activity—no matter how small—marks that sample period as "busy." For cost optimization you need to know whether the SMs are genuinely saturated or just occasionally tickled.</p>
+
+<p>DCGM profiling fields (the DCP metrics) provide true utilization:</p>
+
+<ul>
+<li><code>DCGM_FI_PROF_GR_ENGINE_ACTIVE</code>: fraction of time the graphics engine was active.</li>
+<li><code>DCGM_FI_PROF_SM_ACTIVE</code>: fraction of time at least one warp was active on the SMs.</li>
+<li><code>DCGM_FI_PROF_SM_OCCUPANCY</code>: average fraction of maximum theoretical occupancy achieved across active cycles.</li>
+<li><code>DCGM_FI_PROF_PIPE_TENSOR_ACTIVE</code>: fraction of time the Tensor Core pipeline was active (critical for mixed-precision training and transformer inference).</li>
+<li><code>DCGM_FI_PROF_DRAM_ACTIVE</code>: fraction of time the DRAM controller was active (memory-bound indicator).</li>
+</ul>
+
+<p>When <code>DCGM_FI_DEV_GPU_UTIL</code> is high but <code>DCGM_FI_PROF_SM_ACTIVE</code> or <code>DCGM_FI_PROF_PIPE_TENSOR_ACTIVE</code> are low, the workload is underutilizing the compute resources—perhaps due to small batch size, CPU-bound preprocessing, or inefficient kernels. Conversely, high <code>DCGM_FI_PROF_DRAM_ACTIVE</code> with lower SM activity suggests memory bandwidth saturation, which is a different optimization problem. These metrics, collected via the dcgm-exporter and scraped into Prometheus, give you the ground truth needed to identify waste.</p>
+
+<h2>Right-Sizing Allocation: MIG and Time-Slicing</h2>
+
+<p>Many inference and fine-tuning workloads do not require a full GPU. Allocating a whole A100 to a small model wastes the unused capacity. NVIDIA Multi-Instance GPU (MIG) and time-slicing are the two mechanisms for sharing a physical GPU across multiple workloads.</p>
+
+<h3>MIG Geometry and Instance Counts</h3>
+
+<p>MIG partitions one physical GPU into isolated instances with hardware-level memory, cache, and fault isolation. Internally, a GPU is divided into 7 compute slices (GI slices) and 8 memory slices. The maximum number of MIG instances on one GPU is therefore 7 (seven 1g profiles). Profile naming follows <code>&lt;compute-slices&gt;g.&lt;memory&gt;gb</code>, and the compute-slice budget of 7 determines the maximum count per GPU:</p>
+
+<table>
+<thead>
+<tr><th>Profile</th><th>Compute Slices</th><th>Max Instances per GPU</th><th>Example (A100-40GB)</th></tr>
+</thead>
+<tbody>
+<tr><td>1g</td><td>1</td><td>7</td><td>1g.5gb</td></tr>
+<tr><td>2g</td><td>2</td><td>3</td><td>2g.10gb</td></tr>
+<tr><td>3g</td><td>3</td><td>2</td><td>3g.20gb</td></tr>
+<tr><td>4g</td><td>4</td><td>1</td><td>4g.20gb</td></tr>
+<tr><td>7g</td><td>7</td><td>1</td><td>7g.40gb</td></tr>
+</tbody>
+</table>
+
+<p>On A100-40GB, the memory slice is 5 GB, so profiles are <code>1g.5gb</code>, <code>2g.10gb</code>, <code>3g.20gb</code>, <code>4g.20gb</code>, and <code>7g.40gb</code>. On A100-80GB and H100-80GB, the memory slice is 10 GB, so the 3-slice profile is <code>3g.40gb</code> (not <code>3g.20gb</code>). A common mistake is assuming you can fit four <code>3g</code> instances on one GPU; you cannot, because 4 × 3 = 12 slices exceeds the budget of 7. The maximum is two <code>3g</code> instances per GPU.</p>
+
+<p>MIG provides true isolation: an out-of-memory error or crash in one instance does not affect the others, and each instance has a fixed memory cap enforced in hardware. This makes MIG suitable for multi-tenant inference or for isolating batch jobs that should not interfere with each other.</p>
+
+<h3>Time-Slicing: No Isolation, Lower Overhead</h3>
+
+<p>Time-slicing multiplexes the whole GPU in time across multiple processes or pods. It has <strong>no memory isolation and no fault isolation</strong>—an OOM or crash in one workload can affect others sharing the GPU, and there is no hard memory cap per client. Time-slicing is configured through the NVIDIA device plugin and allows fractional GPU requests in Kubernetes, but the lack of isolation means it is appropriate only for trusted, cooperative workloads or for oversubscription scenarios where you accept the risk.</p>
+
+<p>The cost trade-off: MIG adds a small amount of scheduling and context-switch overhead compared to a dedicated GPU, but the isolation is often worth it. Time-slicing has lower overhead but no protection. Choose MIG when you need guaranteed memory and fault boundaries; choose time-slicing when you need maximum flexibility and the workloads are trusted.</p>
+
+<h2>Batch Size and Continuous Batching</h2>
+
+<p>For inference workloads, batch size is the primary knob for GPU utilization. A small batch size leaves the SMs underutilized and increases the per-token cost. Increasing batch size improves throughput (tokens per second) up to the point where memory or compute saturates, but it also increases latency for each request in the batch. The optimal batch size balances throughput, latency, and cost.</p>
+
+<p>Modern inference engines like vLLM use <strong>continuous batching</strong>: new requests are added to the active batch as soon as earlier requests finish generating tokens, rather than waiting for the entire batch to complete. This keeps the GPU busy without forcing you to choose a single static batch size. vLLM's <code>--max-num-seqs</code> flag controls the maximum number of concurrent sequences per iteration (the batch width), and <code>--max-num-batched-tokens</code> sets the token budget per scheduler step. Tuning these parameters to match your latency SLA and request rate directly impacts GPU utilization and cost per token.</p>
+
+<p>vLLM also exposes <code>--gpu-memory-utilization</code> (default 0.9), which sets the fraction of GPU memory reserved for the KV cache and model weights. Lowering this value leaves headroom for other processes or for oversubscription, but reduces the maximum batch size or context length you can serve. The cost implication: a lower memory utilization means fewer concurrent requests, which may require more GPU instances to meet the same throughput target.</p>
+
+<h2>Eliminating Idle Allocation</h2>
+
+<p>The simplest and most impactful cost reduction is eliminating GPUs that sit idle in a reserved pool. This requires visibility into allocation versus actual usage. In Kubernetes, the extended resource <code>nvidia.com/gpu</code> is integer-only and requires <code>request == limit</code>, so a pod that requests 1 GPU holds that GPU exclusively even if the workload inside uses only 10% of it. If the pod is long-lived (a notebook, a development environment, a model server with low traffic), the GPU is effectively idle but still costs you the full hourly rate.</p>
+
+<p>Strategies to recover idle capacity:</p>
+
+<ul>
+<li><strong>Autoscaling and ephemeral jobs:</strong> Use Kubernetes autoscaling (HPA, KEDA, or custom controllers) to scale inference deployments down to zero replicas during low-traffic periods, and scale batch-training jobs to run only when there is work in the queue. This requires that your workloads tolerate cold-start latency, but it eliminates the cost of idle standby capacity.</li>
+<li><strong>Shared development clusters with time limits:</strong> Enforce time limits on notebook and interactive sessions, and automatically terminate or suspend them after a period of inactivity. Combine this with checkpointing so users can resume work without losing state.</li>
+<li><strong>Bin-packing and fragmentation reduction:</strong> Use node affinity, taints, and the Kubernetes scheduler's bin-packing behavior to concentrate workloads onto fewer nodes, leaving entire nodes empty so they can be drained and powered down (or returned to a cloud provider if using spot or on-demand instances). Fragmentation—many nodes each running one small pod—wastes the unused capacity on each node.</li>
+</ul>
+
+<h2>Draining Nodes Safely for Maintenance and Cost Optimization</h2>
+
+<p>When you need to remove a GPU node from the cluster—either to return unused capacity or to perform maintenance—use <code>kubectl drain</code> to evict running pods safely. The command cordons the node (marks it unschedulable) and then evicts pods via the Eviction API, which respects PodDisruptionBudgets:</p>
+
+<pre><code>kubectl drain &lt;node&gt; --ignore-daemonsets --delete-emptydir-data --grace-period=300
+</code></pre>
+
+<p>Key flags and their real behavior:</p>
+
+<ul>
+<li><code>--ignore-daemonsets</code>: required in practice because DaemonSet pods are not evicted by drain (they are managed by the DaemonSet controller).</li>
+<li><code>--delete-emptydir-data</code>: required to evict pods that use an <code>emptyDir</code> volume, acknowledging that the ephemeral data will be lost.</li>
+<li><code>--grace-period</code>: overrides the pod's <code>terminationGracePeriodSeconds</code>, giving the application time to shut down cleanly.</li>
+<li><code>--timeout</code>: the default is <code>0</code>, which means <strong>wait forever</strong> (no timeout), not "give up immediately." If a pod cannot be evicted (e.g. due to a PodDisruptionBudget that cannot be satisfied), drain will block indefinitely unless you set an explicit timeout.</li>
+<li><code>--disable-eviction</code>: makes drain <strong>delete pods directly instead of using the Eviction API</strong>, which <strong>bypasses PodDisruptionBudgets</strong> and force-removes running pods. This is a last resort for stuck nodes; it does not mean "only delete completed pods."</li>
+</ul>
+
+<p>After draining, the node remains cordoned. If you are returning cloud capacity, terminate the instance. If you are performing maintenance, uncordon the node with <code>kubectl uncordon &lt;node&gt;</code> when ready.</p>
+
+<h2>Network and Interconnect Costs</h2>
+
+<p>For multi-node training, the interconnect—InfiniBand or high-speed Ethernet—is a significant cost component and a performance bottleneck. Understanding realistic bandwidth helps you size the network correctly and avoid over-provisioning.</p>
+
+<p>InfiniBand generations: <strong>HDR is 200 Gb/s</strong>, <strong>NDR is 400 Gb/s</strong>, and EDR is 100 Gb/s per link. Convert line rate to bytes per second by dividing by 8: <strong>200 Gb/s ≈ 25 GB/s</strong> theoretical, with achievable bandwidth around 23–24 GB/s after protocol overhead. For network-bound collective operations like all-reduce, the per-GPU NIC bandwidth caps the achievable bus bandwidth reported by <code>nccl-tests</code>. On a cluster with 200 Gb/s HDR, expect <code>busbw</code> for ring all-reduce to approach 23–25 GB/s per GPU, not 40–45 GB/s (which would require a faster network or multiple NICs per GPU).</p>
+
+<p>Intra-node, NVLink provides much higher bandwidth: <strong>A100 aggregate NVLink bandwidth per GPU is around 600 GB/s</strong> (3rd-gen NVLink), and <strong>H100 is around 900 GB/s</strong> (4th-gen NVLink). NVSwitch connects all GPUs in a node at full NVLink speed, so intra-node collectives are not network-limited. The cost implication: scaling to multiple nodes requires investing in high-speed interconnect (HDR or NDR InfiniBand), and the return on that investment depends on whether your training workload is communication-bound. If gradient all-reduce time is a small fraction of the iteration time, a cheaper network may suffice.</p>
+
+<h2>Monitoring and Continuous Optimization</h2>
+
+<p>GPU cost optimization is not a one-time exercise. Workload characteristics change, new models are deployed, and utilization patterns drift. Instrument your cluster with DCGM metrics, track utilization and idle time per GPU and per workload, and set alerts for sustained low utilization (e.g., <code>DCGM_FI_PROF_SM_ACTIVE &lt; 0.3</code> for more than an hour). Review the data weekly or monthly to identify underutilized capacity, right-size allocations, and adjust autoscaling policies.</p>
+
+<p>The cost structure of GPU infrastructure—dominated by fixed capital or reservation costs—means that small improvements in utilization have large financial impact. A 10-percentage-point increase in average utilization across a 100-GPU cluster can defer the need to purchase or rent additional capacity, saving the cost of those incremental GPUs entirely. The mechanisms described here—correct measurement with profiling metrics, right-sizing with MIG, batch optimization, and eliminating idle allocation—are the levers that deliver that improvement without adding complexity or operational risk.</p>
+<div class="cta">
+Start with the number: the <a href="/">free GPU Idle-Cost Calculator</a> shows what your current utilization is costing per year, in two minutes.<br><br>
+For a human to find the waste on <em>your</em> actual cluster, book a <a href="https://altostratus.biz/Audit">GPU Cost &amp; Reliability Audit →</a>
+</div>
+<div class="box">
+<strong>Get the next field note.</strong> Practical, occasional notes on GPU/K8s cost, scheduling and reliability — the traps and the numbers. No spam.
+<form id="subf" style="display:flex;gap:.5rem;margin-top:.7rem;flex-wrap:wrap">
+<input id="sube" type="email" required placeholder="you@company.com" style="flex:1;min-width:210px;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit">
+<button type="submit" style="padding:.6rem 1.2rem;border:0;border-radius:8px;background:var(--accent);color:#04211f;font-weight:800;cursor:pointer">Subscribe</button>
+</form>
+<div id="subm" style="margin-top:.5rem;font-size:.92rem;color:var(--muted)"></div>
+</div>
+<script>
+(function(){var f=document.getElementById('subf');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var m=document.getElementById('subm');m.textContent='…';fetch('https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:document.getElementById('sube').value,project:'infra',source:'gpu-finops-reducing-ai-infrastructure-cost'})}).then(function(r){return r.json();}).then(function(d){m.textContent=d.ok?"You're on the list — thank you.":('Hmm — '+(d.error||'try again'));if(d.ok)f.reset();}).catch(function(){m.textContent='Network error — try again.';});});})();
+</script>
+<footer>
+<p>Written by Altostratus — senior AI-infrastructure engineering (DGX / RKE2 / Run:AI / Slurm / Kubernetes GPU). We build and validate the boring, load-bearing parts of AI infra so your GPUs behave in production.</p>
+<p><a href="/">GPU Idle-Cost Calculator</a> · <a href="/reduce-kubernetes-gpu-costs.html">Reduce Kubernetes GPU Costs</a> · <a href="/reduce-llm-inference-cost-kubernetes.html">Reduce LLM Inference Cost</a> · <a href="/kubernetes-gpu-scheduling-cost.html">GPU Scheduling &amp; Idle Cost</a> · <a href="/nvidia-gpu-operator-not-detecting-gpus.html">GPU Operator not detecting GPUs</a></p>
+<p>Not affiliated with NVIDIA or Run:AI. Behavior varies by version and hardware; validate against your own cluster.</p>
+</footer>
+</article>
+</div>
+<script>(function(){var T='https://ghtxlbdyvdtdciujnmiy.supabase.co/functions/v1/track';function b(t,x){try{fetch(T,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(Object.assign({type:t,page:location.pathname,ref:document.referrer||''},x||{})),keepalive:true})}catch(e){}}b('pageview');document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a');if(a&&a.href&&/gumroad\.com|amazon\.com|\/l\/|calendly|cal\.com|\/Audit/.test(a.href)){b('cta_click',{meta:{href:a.href}})}},true)})();</script>
+</body>
+</html>
